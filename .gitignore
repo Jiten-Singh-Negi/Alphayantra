@@ -1,0 +1,21 @@
+# Databases and Data Caches
+*.db
+*.parquet
+data/cache/
+
+# Saved ML Models
+*.pkl
+*.pt
+models/saved/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual Environments
+venv/
+env/
+
+# Environment Variables / API Keys
+.env

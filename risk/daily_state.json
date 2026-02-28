@@ -1,0 +1,11 @@
+{
+  "date": "2026-02-28",
+  "trades_today": 0,
+  "pnl_today": 0.0,
+  "capital_deployed": 0.0,
+  "open_positions": 0,
+  "trading_halted": false,
+  "halt_reason": "",
+  "peak_capital": 1000000,
+  "current_capital": 1000000
+}
