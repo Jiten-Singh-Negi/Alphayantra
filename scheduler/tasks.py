@@ -132,7 +132,7 @@ class AlphaYantraScheduler:
                 feed.start()
             risk = self.ctx.get("risk_manager")
             if risk:
-                risk._load_or_init_state()
+                risk.state = risk._load_or_init_state()
             monitor = self.ctx.get("monitor")
             if monitor:
                 monitor.send_message("🔔 Market Open — AlphaYantra live")
@@ -240,7 +240,7 @@ class AlphaYantraScheduler:
                 skip_tcn           = False,
                 tcn_max_samples    = 50_000,
                 tcn_epochs         = 10,
-                use_triple_barrier = True,
+                use_triple_barrier = False,  # v8 fix: triple-barrier produces near-random labels, use trend_quality instead
             )
             self.ctx["ml_model"] = model
 

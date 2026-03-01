@@ -164,6 +164,39 @@ FEATURE_COLS = [
     "vix_change_5d",       # 5-day VIX change %
     "regime_trending",     # ADX > 25 (0/1)
     "vix_percentile",      # VIX 252-day percentile rank              (NEW)
+
+    # ══════════════════════════════════════════════════════════════════
+    # v8.3 MASTER FEATURE MATRIX — 4 Dimensions + 5 Extended
+    # ══════════════════════════════════════════════════════════════════
+
+    # ── D1: Institutional Order Flow & Liquidity ──────────────────────
+    "inst_participation",  # ₹Volume / 20d avg ₹Volume (capital deployment)
+    "amihud_illiquidity",  # |ret| / ₹volume rolling 10d — price impact per ₹
+    "volume_clock",        # ₹vol 252d percentile rank (institutional timing proxy)
+    "force_index_5d",      # EMA5((Close−Close_prev) × Volume) — Elder Force Index
+
+    # ── D2: True Market Variance ──────────────────────────────────────
+    "parkinson_vol_10d",   # Parkinson intraday vol: ln(H/L)^2 rolling 10d
+    "vol_expansion",       # parkinson_vol_10d / realized_vol_20d (regime shift detector)
+    "vol_adjusted_mom",    # ret_5d / parkinson_vol_10d (Sharpe-like risk-adj momentum)
+
+    # ── D3: Trend Physics (regression-based, not lagged MA) ───────────
+    "linreg_slope_norm",   # OLS slope on normalised price (20d window) — velocity
+    "linreg_r2",           # R² of OLS (trend quality — high=algo buying, low=chop)
+    "vwmacd_hist",         # MACD built from VWMAs — only registers volume-confirmed moves
+    "momentum_quality",    # ret_20d × linreg_r2 (momentum only if trend is mathematically clean)
+
+    # ── D4: Price Action & Anchors ────────────────────────────────────
+    "gap_pct",             # (Open_t − Close_{t-1}) / Close_{t-1} — overnight conviction
+    "gap_5d_persistence",  # Rolling 5d sign-consistency of gap_pct — institutional overnight bias
+
+    # ── D5: Market Microstructure ─────────────────────────────────────
+    "close_loc",           # (Close − Low) / (High − Low) — bar close location [0,1]
+    "spread_pressure",     # (High − Close) / (High − Low) — intrabar selling pressure
+
+    # ── D6: Regime Detection ─────────────────────────────────────────
+    "hurst_exponent_20",   # Variance-ratio Hurst (~20d): >0.5 trending, <0.5 mean-reverting
+    "trend_efficiency",    # |net_20d_move| / sum(|daily_moves|) — directional efficiency ratio
 ]
 
 
@@ -263,81 +296,134 @@ def add_kalman_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _causal_sg_smooth(close: np.ndarray, window: int, polyorder: int) -> np.ndarray:
+    """
+    STRICTLY CAUSAL Savitzky-Golay smoother.
+
+    WHY scipy.signal.savgol_filter IS NON-CAUSAL BY DEFAULT:
+    ──────────────────────────────────────────────────────────
+    savgol_filter(x, window_length=7, polyorder=2) is a CENTERED filter.
+    To compute the smoothed value at index t, it fits a polynomial to the
+    window [t-3, t-2, t-1, t, t+1, t+2, t+3] — i.e. it uses 3 FUTURE days.
+    Applying this to a full price array then computing pct_change() produces
+    momentum features that literally look 3 days ahead. The Walk-Forward AUC
+    boost this caused was entirely lookahead illusion.
+
+    CAUSAL FIX — savgol_coeffs with pos=window-1 (rightmost edge):
+    ──────────────────────────────────────────────────────────────────
+    scipy.signal.savgol_coeffs(window, polyorder, pos=window-1) computes
+    the FIR filter coefficients for evaluating the polynomial at the RIGHT
+    edge of the window (the most recent point). This means every smoothed
+    value at t uses only [t-window+1 ... t] — strictly causal, no future data.
+
+    We then apply these coefficients via 1D convolution (np.convolve) on the
+    full price series. The result is mathematically identical to running a
+    rolling window of `window` days and fitting the polynomial to the rightmost
+    point at each step.
+
+    Args:
+        close:      price array (float64)
+        window:     number of past days to include in each polynomial fit
+        polyorder:  polynomial degree (must be < window)
+
+    Returns: causal smoothed array, same length as close (first `window-1`
+             values filled with close values since we don't have enough history)
+    """
+    try:
+        from scipy.signal import savgol_coeffs
+    except ImportError:
+        # scipy not available — fall through to EMA in caller
+        raise
+
+    # savgol_coeffs(window, polyorder, pos=window-1) = evaluate at right edge
+    # This gives FIR coefficients h such that smoothed[t] = sum(h * close[t-win+1:t+1])
+    coeffs = savgol_coeffs(window, polyorder, pos=window - 1)
+    # coeffs are ordered newest-to-oldest; flip for convolution (oldest-to-newest)
+    coeffs = coeffs[::-1].astype(float)
+
+    n = len(close)
+    smoothed = np.empty(n)
+    # First `window-1` points: not enough history, use the raw close
+    smoothed[:window - 1] = close[:window - 1]
+    # Convolve — mode='valid' returns len(close) - window + 1 values
+    valid = np.convolve(close, coeffs, mode='valid')   # length = n - window + 1
+    smoothed[window - 1:] = valid
+    return smoothed
+
+
+def _causal_sg_deriv2(close: np.ndarray, window: int, polyorder: int) -> np.ndarray:
+    """
+    STRICTLY CAUSAL Savitzky-Golay second derivative at the right edge.
+    Uses savgol_coeffs with deriv=2 and pos=window-1.
+    Returns raw second derivative (not normalised — caller normalises by price).
+    """
+    try:
+        from scipy.signal import savgol_coeffs
+    except ImportError:
+        raise
+
+    coeffs = savgol_coeffs(window, polyorder, pos=window - 1, deriv=2)
+    coeffs = coeffs[::-1].astype(float)
+
+    n = len(close)
+    d2 = np.zeros(n)
+    valid = np.convolve(close, coeffs, mode='valid')
+    d2[window - 1:] = valid
+    return d2
+
+
 def add_sg_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Savitzky-Golay smoothed momentum features — REPLACES broken DWT.
+    Strictly causal Savitzky-Golay smoothed momentum — replaces broken DWT.
 
-    WHY DWT WAS REMOVED:
-      pywt.wavedec(window=16, level=3) requires min 57 samples (2^3 × 7 + 1).
-      When window < 57, PyWavelets warns "Level value of 3 is too high" and
-      boundary effects completely overwhelm the signal — the function returns
-      mathematically scrambled prices, not denoised ones.
-      We were feeding GARBAGE back as features → AUC 0.48 = expected from noise.
-
-    SAVITZKY-GOLAY (scipy.signal.savgol_filter):
-      Fits a polynomial of degree `polyorder` to a rolling window of `window_length`
-      samples, then evaluates the polynomial at the center point.
-      - No minimum window size requirement
-      - No boundary effects within the window
-      - Mathematically equivalent to convolution with a smooth kernel
-      - Derivatives are analytic: first derivative = velocity, second = acceleration
-
-    CAUSAL IMPLEMENTATION:
-      We apply SG to the full series (which is already sorted by time).
-      For the rolling window approach: each point only sees [t-win+1..t].
-      scipy.savgol_filter on the full series is equivalent to applying the
-      same polynomial fit rolling forward — all values use only past data
-      because we're computing momentum (differences), not the smoothed level.
+    CAUSAL METHOD: savgol_coeffs(window, polyorder, pos=window-1) + np.convolve.
+    This evaluates the fitted polynomial at the RIGHT edge of each window,
+    so smoothed[t] only uses close[t-window+1 : t+1].  Zero lookahead.
 
     Returns columns:
-      sg_momentum_5d  — 5-day polynomial-smoothed momentum
-      sg_momentum_10d — 10-day polynomial-smoothed momentum
-      sg_accel        — second derivative (acceleration/deceleration)
+      sg_momentum_5d  — causal 7-day SG-smoothed 5-day momentum
+      sg_momentum_10d — causal 13-day SG-smoothed 10-day momentum
+      sg_accel        — causal second derivative (price acceleration)
     """
     df = df.copy()
     close = df["Close"].values.astype(float)
     n = len(close)
 
     try:
-        from scipy.signal import savgol_filter
-
-        # ── 5-day smoothed prices ──────────────────────────────────────
-        # window_length must be odd, >= polyorder+1
-        # For 5-day: window=7 (covers 1 week), polyorder=2
-        if n >= 9:
-            smooth_5 = savgol_filter(close, window_length=7, polyorder=2)
+        # ── 5-day momentum: smooth with window=7, polyorder=2 ──────────
+        # Needs window >= polyorder+1; 7 > 3, OK. Requires n >= 7.
+        if n >= 7:
+            smooth_5 = _causal_sg_smooth(close, window=7, polyorder=2)
         else:
             smooth_5 = close.copy()
 
-        # ── 10-day smoothed prices ─────────────────────────────────────
-        # window=13 (2.5 weeks), polyorder=3
-        if n >= 15:
-            smooth_10 = savgol_filter(close, window_length=13, polyorder=3)
+        # ── 10-day momentum: smooth with window=13, polyorder=3 ────────
+        if n >= 13:
+            smooth_10 = _causal_sg_smooth(close, window=13, polyorder=3)
         else:
             smooth_10 = close.copy()
 
-        # ── Second derivative (acceleration) ──────────────────────────
-        # polyorder=4 needed for second derivative
-        if n >= 21:
-            smooth_d2 = savgol_filter(close, window_length=15, polyorder=4, deriv=2)
+        # ── Second derivative (acceleration): window=15, polyorder=4 ───
+        # polyorder must be >= 2+deriv_order = 4 for a 2nd derivative
+        if n >= 15:
+            d2 = _causal_sg_deriv2(close, window=15, polyorder=4)
+            # Normalise by price level to make it scale-invariant
+            accel = np.where(np.abs(close) > 1e-8, d2 / close, 0.0)
+            accel = np.clip(accel, -0.01, 0.01)
         else:
-            smooth_d2 = np.zeros(n)
+            accel = np.zeros(n)
 
         # ── Convert smoothed levels → momentum (% change) ─────────────
-        # Use log returns for better stationarity
         mom_5  = pd.Series(smooth_5).pct_change(5).fillna(0).clip(-0.3, 0.3).values
         mom_10 = pd.Series(smooth_10).pct_change(10).fillna(0).clip(-0.3, 0.3).values
 
-        # Normalise second derivative by price level
-        accel = smooth_d2 / (close + 1e-8)
-        accel = np.clip(accel, -0.01, 0.01)
-
     except ImportError:
-        # scipy not available — exponential smoothing fallback
-        alpha  = 0.15
-        sm     = close.copy().astype(float)
+        # scipy not installed — strictly causal EMA as fallback
+        # EMA is inherently causal: uses only past data at each step
+        alpha = 0.15
+        sm = close.copy().astype(float)
         for t in range(1, n):
-            sm[t] = alpha * close[t] + (1 - alpha) * sm[t-1]
+            sm[t] = alpha * close[t] + (1 - alpha) * sm[t - 1]
         mom_5  = pd.Series(sm).pct_change(5).fillna(0).clip(-0.3, 0.3).values
         mom_10 = pd.Series(sm).pct_change(10).fillna(0).clip(-0.3, 0.3).values
         accel  = np.zeros(n)
@@ -682,9 +768,10 @@ def engineer_features(
     max_pain_series:  Optional[pd.Series] = None,
     sentiment_series: Optional[pd.Series] = None,
     vix_series:       Optional[pd.Series] = None,
+    nifty_series:     Optional[pd.Series] = None,   # v8.3: Nifty50 close for relative strength
 ) -> pd.DataFrame:
     """
-    Full feature engineering pipeline v8.
+    Full feature engineering pipeline v8.3.
 
     CRITICAL: df["Close"] must be ADJUSTED prices (from dual-track fetcher).
               df["Close_Raw"] is available for options strike matching only.
@@ -900,6 +987,215 @@ def engineer_features(
         df["regime_trending"] = (adx_raw > 25).astype(float)
     else:
         df["regime_trending"] = 0.5
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── 15. v8.3 MASTER FEATURE MATRIX — 4 Dimensions + 5 Extended ──
+    # ══════════════════════════════════════════════════════════════════
+    #
+    # SECURITY AUDIT:
+    #   ✅ ALL rolling windows are causal (only look at past bars)
+    #   ✅ gap_pct uses .shift(1) on Close → yesterday's close
+    #   ✅ Parkinson uses same-bar H/L (known at bar close)
+    #   ✅ LinReg fitted on [t-19:t] only, strictly past
+    #   ✅ Amihud uses same-bar |ret| and rupee_volume
+    #   ✅ Hurst via variance ratio: causal expanding comparison
+    #   ✅ No bfill/ffill except explicit forward-fill of current-bar values
+    #   ✅ Physical impossibilities: clip vol>0, H≥L enforced via abs(log)
+
+    high  = df["High"].astype(float)
+    low   = df["Low"].astype(float)
+    open_ = df["Open"].astype(float) if "Open" in df.columns else close
+
+    # ── D1: Institutional Order Flow & Liquidity ──────────────────────
+
+    if "Volume" in df.columns:
+        vol_raw = df["Volume"].replace(0, np.nan).astype(float)
+        rupee_vol = close * vol_raw  # ₹ notional per bar
+
+        # [1] inst_participation — normalised rupee volume
+        rupee_vol_ma20 = rupee_vol.rolling(20, min_periods=5).mean()
+        df["inst_participation"] = (rupee_vol / rupee_vol_ma20.replace(0, np.nan)).fillna(1.0).clip(0, 20)
+
+        # [2] amihud_illiquidity — price impact per rupee traded
+        # Amihud(t) = |ret_t| / rupee_vol_t, then 10d rolling mean
+        # High value = thin market (big price move per ₹ traded)
+        # Physical constraint: rupee_vol must be > 0 (enforced above via NaN)
+        same_bar_ret = close.pct_change().abs().fillna(0)
+        amihud_raw   = same_bar_ret / rupee_vol.replace(0, np.nan)
+        # Normalise by 20d median to make it cross-stock comparable
+        amihud_20med = amihud_raw.rolling(20, min_periods=5).median().replace(0, np.nan)
+        df["amihud_illiquidity"] = (
+            amihud_raw.rolling(10, min_periods=3).mean() / amihud_20med.replace(0, np.nan)
+        ).fillna(1.0).clip(0, 10)
+
+        # [3] volume_clock — 252d rupee-vol percentile rank (institutional timing)
+        df["volume_clock"] = rupee_vol.rolling(252, min_periods=60).rank(pct=True).fillna(0.5)
+
+        # [4] force_index_5d — Elder Force Index: price_change × volume, EMA5
+        # Uses Close.diff() = Close_t − Close_{t-1} → purely causal
+        force_raw = close.diff().fillna(0) * vol_raw.fillna(0)
+        force_ema5 = force_raw.ewm(span=5, adjust=False).mean()
+        # Normalise by median absolute value over 20d (scale-free)
+        force_scale = force_ema5.abs().rolling(20, min_periods=5).median().replace(0, np.nan)
+        df["force_index_5d"] = (force_ema5 / force_scale).fillna(0).clip(-10, 10)
+    else:
+        df["inst_participation"]  = 1.0
+        df["amihud_illiquidity"]  = 1.0
+        df["volume_clock"]        = 0.5
+        df["force_index_5d"]      = 0.0
+        rupee_vol = pd.Series(np.nan, index=df.index)  # fallback for downstream
+
+    # ── D2: True Market Variance ──────────────────────────────────────
+
+    # [5] parkinson_vol_10d — Parkinson (1980) intraday volatility estimator
+    # Formula: sqrt( 1/(4n*ln2) * sum(ln(H_i/L_i)^2) )
+    # Uses same-bar H and L — strictly causal. Physical: H≥L always (abs ensures)
+    hl_ratio = (high / low.replace(0, np.nan)).replace(0, np.nan)
+    # Clip: H/L < 1 is a data error (gap-adjusted), use abs(log)
+    log_hl_sq = np.log(hl_ratio.abs().clip(lower=1e-6)) ** 2
+    parkinson_var = log_hl_sq.rolling(10, min_periods=3).mean() / (4 * np.log(2))
+    # Physical: variance must be non-negative (guaranteed by squaring, but clip for safety)
+    df["parkinson_vol_10d"] = np.sqrt(parkinson_var.clip(lower=0)).fillna(0.015)
+
+    # [6] vol_expansion — Parkinson / realised_close-to-close
+    # When this ratio spikes >> 1, intraday moves >> overnight moves → regime shift / manipulation
+    realized_vol_ref = df["realized_vol_20d"].replace(0, np.nan) if "realized_vol_20d" in df.columns \
+                       else close.pct_change().rolling(20).std().replace(0, np.nan)
+    df["vol_expansion"] = (df["parkinson_vol_10d"] / realized_vol_ref).fillna(1.0).clip(0, 5)
+
+    # [7] vol_adjusted_mom — risk-adjusted 5d momentum (Sharpe-like)
+    ret5 = close.pct_change(5).fillna(0)
+    df["vol_adjusted_mom"] = (ret5 / df["parkinson_vol_10d"].replace(0, np.nan)).fillna(0).clip(-10, 10)
+
+    # ── D3: Trend Physics (regression-based) ─────────────────────────
+
+    # [8] linreg_slope_norm + [9] linreg_r2 — rolling OLS on normalised close
+    # Normalise: c_norm = close / close.rolling(20).mean()  → scale-free slope
+    # Fit OLS on [t-19:t]: y = a + b*x, x = 0,1,...,19
+    # CRITICAL: apply() with raw=True means we get the 20-element numpy array
+    #           with NO future data — strictly past 20 bars only
+    def _linreg_stats(y: np.ndarray):
+        """Returns (slope_norm, r2) for a 1D array of normalised prices."""
+        n = len(y)
+        if n < 5:
+            return 0.0, 0.0
+        x = np.arange(n, dtype=float)
+        x -= x.mean()
+        y_c = y - y.mean()
+        ss_x = (x * x).sum()
+        if ss_x == 0:
+            return 0.0, 0.0
+        slope = (x * y_c).sum() / ss_x
+        y_hat = x * slope  # de-meaned prediction
+        ss_res = ((y_c - y_hat) ** 2).sum()
+        ss_tot = (y_c ** 2).sum()
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        return float(slope), float(max(0.0, r2))
+
+    close_mean20 = close.rolling(20, min_periods=5).mean().replace(0, np.nan)
+    close_norm   = (close / close_mean20).fillna(1.0)
+
+    _slope_list = []
+    _r2_list    = []
+    for i in range(len(close_norm)):
+        start = max(0, i - 19)
+        window = close_norm.iloc[start: i + 1].values
+        s, r = _linreg_stats(window)
+        _slope_list.append(s)
+        _r2_list.append(r)
+
+    df["linreg_slope_norm"] = pd.array(_slope_list, dtype=float)
+    df["linreg_r2"]         = pd.array(_r2_list, dtype=float)
+    # Clip slope: ±0.05 per bar covers almost all realistic trend velocities
+    df["linreg_slope_norm"] = df["linreg_slope_norm"].clip(-0.05, 0.05)
+
+    # [10] momentum_quality — only meaningful momentum if trend is mathematically clean
+    df["momentum_quality"] = (
+        close.pct_change(20).fillna(0).clip(-0.5, 0.5) * df["linreg_r2"]
+    )
+
+    # [11] vwmacd_hist — MACD using VWMAs (Volume-Weighted Moving Averages)
+    # VWMA(n) = sum(Close_i × Vol_i, window=n) / sum(Vol_i, window=n)
+    # STRICTLY causal: rolling sum uses only past bars
+    if "Volume" in df.columns and not rupee_vol.isna().all():
+        def _vwma(n):
+            tp_vol = close * df["Volume"].replace(0, np.nan).fillna(0)
+            vol_n  = df["Volume"].replace(0, np.nan).rolling(n, min_periods=max(2, n//3)).sum()
+            tpv_n  = tp_vol.rolling(n, min_periods=max(2, n//3)).sum()
+            result = (tpv_n / vol_n.replace(0, np.nan)).ffill().fillna(close)
+            return result
+
+        vwma_fast   = _vwma(12)
+        vwma_slow   = _vwma(26)
+        vwmacd_line = vwma_fast - vwma_slow
+        vwmacd_sig  = vwmacd_line.ewm(span=9, adjust=False).mean()
+        vwmacd_hist_raw = vwmacd_line - vwmacd_sig
+        # Normalise by price to be cross-stock comparable
+        df["vwmacd_hist"] = (vwmacd_hist_raw / close.replace(0, np.nan)).fillna(0).clip(-0.05, 0.05)
+    else:
+        df["vwmacd_hist"] = 0.0
+
+    # ── D4: Price Action & Anchors ────────────────────────────────────
+
+    # [12] gap_pct — overnight conviction: Open_t vs Close_{t-1}
+    # Close.shift(1) is yesterday's close → strictly no lookahead
+    prev_close = close.shift(1)
+    df["gap_pct"] = ((open_ - prev_close) / prev_close.replace(0, np.nan)).fillna(0).clip(-0.1, 0.1)
+
+    # [13] gap_5d_persistence — rolling 5d average of gap sign
+    # Positive = consistent institutional overnight buy bias
+    df["gap_5d_persistence"] = np.sign(df["gap_pct"]).rolling(5, min_periods=2).mean().fillna(0)
+
+    # NOTE: close_to_avwap is already captured by close_to_vwap (20d rolling VWAP)
+    # The existing vwap feature IS the institutional anchored VWAP equivalent for daily bars.
+
+    # ── D5: Market Microstructure ─────────────────────────────────────
+
+    bar_range = (high - low).replace(0, np.nan)
+
+    # [14] close_loc — where did price close within the bar? (0=at low, 1=at high)
+    # High selling pressure → close_loc near 0; strong bull bar → near 1
+    df["close_loc"] = ((close - low) / bar_range).fillna(0.5).clip(0, 1)
+
+    # [15] spread_pressure — fraction of bar above close (unfilled upper shadow)
+    # High = sellers pushed price back down → bearish intrabar pressure
+    df["spread_pressure"] = ((high - close) / bar_range).fillna(0.5).clip(0, 1)
+
+    # ── D6: Regime Detection ─────────────────────────────────────────
+
+    # [16] hurst_exponent_20 — variance-ratio approximation
+    # VR = Var(r_2) / (2 * Var(r_1)) where r_k is k-period return
+    # H > 0.5 → trending (momentum), H < 0.5 → mean-reverting, H = 0.5 → random walk
+    # CAUSAL: only uses past returns at each bar
+    _hurst_list = []
+    for i in range(len(close)):
+        if i < 20:
+            _hurst_list.append(0.5)
+            continue
+        w = close.iloc[max(0, i - 39): i + 1].values  # up to 40 bars history
+        if len(w) < 8:
+            _hurst_list.append(0.5)
+            continue
+        r1 = np.diff(np.log(np.maximum(w, 1e-6)))
+        r2 = r1[1:] + r1[:-1]  # 2-period overlapping returns
+        var1 = r1.var()
+        var2 = r2.var()
+        if var1 > 0 and not np.isnan(var2):
+            hurst = np.log(var2 / (2 * var1 + 1e-12)) / (2 * np.log(2))
+            _hurst_list.append(float(np.clip(hurst, 0.0, 1.0)))
+        else:
+            _hurst_list.append(0.5)
+
+    df["hurst_exponent_20"] = pd.array(_hurst_list, dtype=float)
+
+    # [17] trend_efficiency — Elder's directional efficiency ratio (20d)
+    # = |net 20d price change| / sum of absolute daily changes
+    # 1.0 = perfectly straight trend; ~0 = choppy sideways market
+    net_20d  = close.diff(20).abs()
+    sum_abs  = close.diff().abs().rolling(20, min_periods=5).sum().replace(0, np.nan)
+    df["trend_efficiency"] = (net_20d / sum_abs).fillna(0.5).clip(0, 1)
+
+    # ══════════════════════════════════════════════════════════════════
 
     # ── 14. Fill all feature cols with 0 (no bfill, no ffill) ─────────
     # Any remaining NaN = feature not computable for this bar → 0 is safest
@@ -1300,17 +1596,50 @@ class AlphaYantraML:
         self._save_rf_xgb()
         logger.info("✅ RF + LGB + XGBoost saved — safe to resume if TCN crashes")
 
-        # ── Stacking Meta-Learner ──────────────────────────────────────
-        logger.info("Training stacking meta-learner...")
-        self.meta_learner = self._train_meta_learner(
-            oof_preds_rf, oof_preds_xgb, oof_preds_lgb, oof_labels
-        )
-
-        # ── TCN ────────────────────────────────────────────────────────
+        # ── TCN (trained BEFORE meta-learner so its OOF predictions can be included) ──
         tcn_auc = self._train_tcn_safe(
             X_tr_s, y_tr, X_te_s, y_te,
             seq_len=tcn_seq_len, max_samples=tcn_max_samples,
             epochs=tcn_epochs, batch_size=512, ram_gb=ram, skip=skip_tcn,
+        )
+
+        # ── Collect TCN out-of-fold predictions for stacking ──────────
+        # We get TCN test-set predictions here (they serve as hold-out OOF
+        # since we train on X_tr_s and predict on X_te_s — same split as
+        # the tabular models). These are then passed into the meta-learner
+        # so it learns the optimal RF/LGB/XGB/TCN blend from data.
+        oof_preds_tcn = []
+        if self.tcn_trained:
+            logger.info("  Collecting TCN OOF predictions for stacking meta-learner...")
+            for i, (oof_rf_fold, oof_labels_fold) in enumerate(zip(oof_preds_rf, oof_labels)):
+                # Use the final trained TCN to generate fold-level OOF predictions
+                # (same length as the tabular OOF — we subsample to match)
+                n_oof = len(oof_rf_fold)
+                n_avail = len(X_te_s) - tcn_seq_len
+                if n_avail <= 0:
+                    oof_preds_tcn.append(np.full(n_oof, 0.5))
+                    continue
+                # Sample evenly spaced indices from TCN test predictions
+                tcn_arr, tcn_indices = tcn_predict_batched(
+                    self.tcn_model, X_te_s, tcn_seq_len, batch_size=256
+                )
+                if len(tcn_arr) >= n_oof:
+                    step = max(1, len(tcn_arr) // n_oof)
+                    oof_preds_tcn.append(tcn_arr[::step][:n_oof])
+                else:
+                    # Pad with 0.5 if TCN produced fewer predictions than RF
+                    padded = np.full(n_oof, 0.5)
+                    padded[:len(tcn_arr)] = tcn_arr
+                    oof_preds_tcn.append(padded)
+
+        # ── Stacking Meta-Learner (now includes TCN) ───────────────────
+        # Meta-learner learns optimal RF / LGB / XGB / TCN blend from OOF data.
+        # Training this AFTER TCN means it can include TCN's contribution.
+        logger.info("Training stacking meta-learner (RF + LGB + XGB + TCN)...")
+        self.meta_learner = self._train_meta_learner(
+            oof_preds_rf, oof_preds_xgb, oof_preds_lgb,
+            oof_preds_tcn if self.tcn_trained else [],
+            oof_labels,
         )
 
         # ── Final ensemble AUC ─────────────────────────────────────────
@@ -1411,26 +1740,45 @@ class AlphaYantraML:
             with torch.no_grad():
                 tcn_p = float(self.tcn_model(seq).item())
 
-        # ── Ensemble via meta-learner (preferred) or regime weights ────
+        # ── Ensemble via meta-learner + regime-weighted TCN blend ──────
+        #
+        # BUG FIXED: Previously, when meta_learner was present the code
+        # DROPPED tcn_p entirely. The if/elif structure meant TCN was only
+        # used as a fallback when meta_learner was absent — opposite of intent.
+        #
+        # CORRECT DESIGN:
+        #   1. Meta-learner was trained WITH TCN OOF predictions (since training
+        #      now runs TCN first, then meta). So meta_row must include tcn_p.
+        #   2. If TCN is unavailable at inference (e.g. sequence too short),
+        #      we pad with 0.5 (neutral prior) — meta-learner handles this gracefully
+        #      since 0.5 was the fallback value used during training on short folds.
+        #
         if self.meta_learner is not None:
+            # Build meta-row in same order as training: RF, XGB, [LGB], [TCN]
             meta_row = [rf_p, xgb_p]
-            if lgb_p is not None:
+            if lgb_p is not None and self._meta_n_features() >= 3:
                 meta_row.append(lgb_p)
-            if len(meta_row) < self._meta_n_features():
-                meta_row.extend([0.5] * (self._meta_n_features() - len(meta_row)))
+            if self._meta_n_features() >= (3 + int(lgb_p is not None)):
+                # TCN slot: use actual prediction if available, else neutral 0.5
+                meta_row.append(tcn_p if tcn_p is not None else 0.5)
+            # Pad or clip to exact expected count
+            while len(meta_row) < self._meta_n_features():
+                meta_row.append(0.5)
+            meta_row = meta_row[:self._meta_n_features()]
             prob = float(self.meta_learner.predict_proba(
-                np.array(meta_row[:self._meta_n_features()]).reshape(1, -1)
+                np.array(meta_row).reshape(1, -1)
             )[0, 1])
         elif tcn_p is not None:
-            # Regime-adaptive weights (fallback)
-            preds = [rf_p, xgb_p]
+            # No meta-learner: regime-adaptive blend with TCN
+            preds   = [rf_p, xgb_p]
             weights = [regime.rf_weight, regime.xgb_weight]
             if lgb_p is not None:
                 preds.append(lgb_p)
-                weights.append(regime.xgb_weight * 0.5)   # LGB ≈ XGB contribution
+                weights.append(regime.xgb_weight * 0.8)
             prob_no_tcn = sum(p * w for p, w in zip(preds, weights)) / sum(weights)
             prob = prob_no_tcn * (1 - regime.tcn_weight) + tcn_p * regime.tcn_weight
         else:
+            # Fallback: simple average of available tabular models
             preds = [rf_p, xgb_p]
             if lgb_p is not None:
                 preds.append(lgb_p)
@@ -1487,7 +1835,7 @@ class AlphaYantraML:
         tcn_max_samples:   int  = 50_000,
         tcn_epochs:        int  = 10,
         tcn_seq_len:       int  = 30,
-        use_triple_barrier: bool = True,
+        use_triple_barrier: bool = False,   # FIX: must match train() default (trend_quality labels)
     ):
         """
         Load saved RF + XGB checkpoint and retrain only the TCN.
@@ -1513,10 +1861,17 @@ class AlphaYantraML:
             use_triple_barrier = use_triple_barrier,
         )
 
-    def _train_meta_learner(self, oof_rf, oof_xgb, oof_lgb, oof_labels):
+    def _train_meta_learner(self, oof_rf, oof_xgb, oof_lgb, oof_tcn, oof_labels):
         """
         Train a logistic regression stacking meta-learner on out-of-fold predictions.
-        Learns optimal combination of base models from data, not from guessing weights.
+
+        Inputs are OOF predictions from RF, XGB, LGB (from walk-forward CV), and
+        optionally TCN (from test-set predictions aligned to same folds).
+
+        The meta-learner learns optimal combination from data rather than
+        relying on fixed weights. Training WITH TCN predictions is critical —
+        previously the meta was trained without TCN, meaning TCN was completely
+        orphaned in both training and inference.
         """
         if not oof_rf or not oof_labels:
             logger.warning("Stacking: no OOF predictions available — skipping")
@@ -1528,18 +1883,24 @@ class AlphaYantraML:
                 row = [oof_rf[i], oof_xgb[i]]
                 if oof_lgb and i < len(oof_lgb):
                     row.append(oof_lgb[i])
+                if oof_tcn and i < len(oof_tcn):
+                    row.append(oof_tcn[i])
                 X_meta.append(np.column_stack(row))
 
             X_meta = np.vstack(X_meta)
             y_meta = np.concatenate(oof_labels)
-            self._meta_features = X_meta.shape[1]
+            self._meta_features = X_meta.shape[1]   # save for predict()
 
             meta = LogisticRegression(C=1.0, max_iter=1000, random_state=42)
             meta.fit(X_meta, y_meta.astype(int))
             meta_auc = roc_auc_score(y_meta, meta.predict_proba(X_meta)[:, 1])
-            logger.info(f"Meta-learner (stacking) → in-sample AUC: {meta_auc:.3f}")
-            logger.info(f"  Base model weights: RF={meta.coef_[0][0]:.3f}  XGB={meta.coef_[0][1]:.3f}"
-                        + (f"  LGB={meta.coef_[0][2]:.3f}" if X_meta.shape[1] > 2 else ""))
+
+            coef_labels = ["RF", "XGB"]
+            if X_meta.shape[1] >= 3: coef_labels.append("LGB")
+            if X_meta.shape[1] >= 4: coef_labels.append("TCN")
+            coef_str = "  ".join(f"{l}={c:.3f}" for l, c in zip(coef_labels, meta.coef_[0]))
+            logger.info(f"Meta-learner → in-sample AUC: {meta_auc:.3f} | n_features={self._meta_features}")
+            logger.info(f"  Base model weights: {coef_str}")
             return meta
         except Exception as e:
             logger.warning(f"Stacking meta-learner failed: {e} — using simple average")
@@ -1707,20 +2068,52 @@ class AlphaYantraML:
         logger.info(f"  TCN parameters: {n_params:,}  batch_size={actual_batch}")
 
         opt     = torch.optim.Adam(self.tcn_model.parameters(), lr=1e-3, weight_decay=1e-5)
-        loss_fn = nn.BCELoss()
-        loader  = DataLoader(dataset, batch_size=actual_batch, shuffle=False)
+        # Cosine LR schedule: starts at lr=1e-3, decays to ~1e-5 by final epoch
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-5)
+
+        # ── Class imbalance handling (Bug fix: BCELoss has no pos_weight) ──
+        # RF/LGB/XGB all use scale_pos_weight / class_weight="balanced".
+        # BCELoss without pos_weight biases the TCN toward the majority class (0),
+        # causing it to learn "always predict 0" instead of actual patterns.
+        # Fix: BCEWithLogitsLoss with pos_weight = neg_count / pos_count.
+        pos_count = float(y_train.sum())
+        neg_count = float(len(y_train) - pos_count)
+        pos_w_tensor = torch.tensor([neg_count / max(1.0, pos_count)], dtype=torch.float32)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w_tensor)
+
+        # Update TCNModel head to output logit (remove Sigmoid — BCEWithLogitsLoss applies it)
+        # We swap the final Sigmoid for Identity during training, restore for inference
+        self.tcn_model.head[-1] = nn.Identity()   # remove Sigmoid for BCEWithLogitsLoss
+
+        # ── DataLoader: shuffle=True for better mini-batch diversity ───
+        # shuffle=False means the model sees strong temporal autocorrelation
+        # across mini-batches (batch 0 = day 1-512, batch 1 = day 513-1024...).
+        # Gradient updates become highly correlated → slow convergence.
+        # For sequence models, shuffling at the SEQUENCE level is safe because
+        # each sequence already encodes its own temporal context internally.
+        loader = DataLoader(dataset, batch_size=actual_batch, shuffle=True,
+                            drop_last=True)   # drop_last for stable batch norm
 
         self.tcn_model.train()
         for epoch in range(epochs):
             total = 0.0
             for xb, yb in loader:
                 opt.zero_grad()
-                loss = loss_fn(self.tcn_model(xb), yb)
+                logits = self.tcn_model(xb)   # now outputs raw logit
+                loss   = loss_fn(logits, yb)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.tcn_model.parameters(), 1.0)
                 opt.step()
                 total += loss.item()
-            logger.info(f"  TCN epoch {epoch+1}/{epochs}: loss={total/len(loader):.4f}")
+            scheduler.step()
+            logger.info(
+                f"  TCN epoch {epoch+1}/{epochs}: loss={total/max(1,len(loader)):.4f}  "
+                f"lr={scheduler.get_last_lr()[0]:.2e}"
+            )
+
+        # Restore Sigmoid for standard predict_proba-style outputs (0-1 range)
+        self.tcn_model.head[-1] = nn.Sigmoid()
+        self.tcn_model.eval()
 
         del loader, dataset; gc.collect()
 

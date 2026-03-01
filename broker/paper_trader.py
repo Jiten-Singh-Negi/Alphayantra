@@ -107,9 +107,11 @@ class PaperPosition:
     stop_loss:     float
     take_profit:   float
     entry_time:    str
+    direction:     str      = "LONG"   # "LONG" or "SHORT" — needed for correct PnL direction
     unrealised_pnl: float   = 0.0
     unrealised_pct: float   = 0.0
-    highest_price: float    = 0.0   # for trailing stop tracking
+    highest_price: float    = 0.0   # for trailing stop tracking (LONG)
+    lowest_price:  float    = 0.0   # for trailing stop tracking (SHORT)
     trailing_stop: float    = 0.0
 
 
@@ -190,7 +192,7 @@ class PaperTrader:
         spread = live_price * 0.0005
         fill_price = (live_price + spread) if is_buy else (live_price - spread)
 
-        quantity = max(1, int(trade_value / fill_price))
+        quantity = max(1, int(trade_value / fill_price)) if is_buy else self.positions[ticker].quantity
 
         order = PaperOrder(
             order_id      = str(uuid.uuid4())[:8],
@@ -248,29 +250,58 @@ class PaperTrader:
         """
         Refresh unrealised P&L for all open positions.
         Call this from the live feed callback (every tick or every 5 seconds).
+
+        BUG FIXED: Previously `unrealised_pnl = (price - avg_price) * qty`
+        always assumed a LONG position.  For a SHORT at Rs100 that drops to
+        Rs90, the profit is (100 - 90) * qty — the opposite sign.
+        Fix: multiply by direction_mult = +1 for LONG, -1 for SHORT.
+
+        Auto-exit conditions are also direction-aware:
+          LONG:  SL fires when price drops to stop_loss (price <= SL)
+                 TP fires when price rises to take_profit (price >= TP)
+          SHORT: SL fires when price rises to stop_loss (price >= SL)
+                 TP fires when price drops to take_profit (price <= TP)
         """
         with self._lock:
-            for ticker, pos in self.positions.items():
+            for ticker, pos in list(self.positions.items()):
                 price = self._get_live_price(ticker)
                 if price is None:
                     continue
-                pos.current_price  = price
-                pos.unrealised_pnl = round((price - pos.avg_price) * pos.quantity, 2)
-                pos.unrealised_pct = round((price / pos.avg_price - 1) * 100, 3)
+                pos.current_price = price
 
-                # Update trailing stop
-                if price > pos.highest_price:
-                    pos.highest_price = price
-                    atr_est = price * 0.015
-                    pos.trailing_stop = max(pos.trailing_stop, price - atr_est)
+                is_long = (pos.direction == "LONG")
+                direction_mult = 1 if is_long else -1
 
-                # Auto-exit checks
-                if price <= pos.stop_loss:
-                    self._auto_exit(ticker, price, "SL_HIT")
-                elif price >= pos.take_profit:
-                    self._auto_exit(ticker, price, "TP_HIT")
-                elif pos.trailing_stop > pos.avg_price and price <= pos.trailing_stop:
-                    self._auto_exit(ticker, price, "TRAIL_STOP")
+                # Direction-aware PnL
+                pos.unrealised_pnl = round(direction_mult * (price - pos.avg_price) * pos.quantity, 2)
+                pos.unrealised_pct = round(direction_mult * (price / pos.avg_price - 1) * 100, 3)
+
+                # Trailing stop update
+                atr_est = price * 0.015
+                if is_long:
+                    if price > pos.highest_price:
+                        pos.highest_price = price
+                        pos.trailing_stop = max(pos.trailing_stop, price - atr_est)
+                else:  # SHORT
+                    if price < pos.lowest_price:
+                        pos.lowest_price = price
+                        pos.trailing_stop = min(pos.trailing_stop, price + atr_est)
+
+                # Direction-aware auto-exit checks
+                if is_long:
+                    if price <= pos.stop_loss:
+                        self._auto_exit(ticker, price, "SL_HIT")
+                    elif price >= pos.take_profit:
+                        self._auto_exit(ticker, price, "TP_HIT")
+                    elif pos.trailing_stop > pos.avg_price and price <= pos.trailing_stop:
+                        self._auto_exit(ticker, price, "TRAIL_STOP")
+                else:  # SHORT
+                    if price >= pos.stop_loss:
+                        self._auto_exit(ticker, price, "SL_HIT")
+                    elif price <= pos.take_profit:
+                        self._auto_exit(ticker, price, "TP_HIT")
+                    elif pos.trailing_stop < pos.avg_price and price >= pos.trailing_stop:
+                        self._auto_exit(ticker, price, "TRAIL_STOP")
 
     def get_portfolio_summary(self) -> dict:
         """Live portfolio snapshot with net P&L after all transaction costs."""
@@ -329,6 +360,7 @@ class PaperTrader:
         return None
 
     def _open_position(self, order: PaperOrder, sl: float, tp: float):
+        direction = "LONG" if order.direction == "BUY" else "SHORT"
         self.positions[order.ticker] = PaperPosition(
             ticker        = order.ticker,
             quantity      = order.quantity,
@@ -337,17 +369,29 @@ class PaperTrader:
             stop_loss     = sl,
             take_profit   = tp,
             entry_time    = order.fill_time,
-            highest_price = order.fill_price,
+            direction     = direction,
+            highest_price = order.fill_price,    # LONG tracking
+            lowest_price  = order.fill_price,    # SHORT tracking
             trailing_stop = sl,
         )
-        logger.info(f"  PaperBUY  {order.ticker} × {order.quantity} @ ₹{order.fill_price:,.2f}")
+        logger.info(
+            f"  Paper{'BUY' if direction == 'LONG' else 'SHORT'}"
+            f"  {order.ticker} x {order.quantity} @ Rs{order.fill_price:,.2f}"
+            f"  SL={sl:,.2f}  TP={tp:,.2f}"
+        )
 
     def _close_position(self, ticker: str, order: PaperOrder) -> float:
         pos = self.positions.pop(ticker, None)
         if pos is None:
             return 0.0
 
-        gross_pnl = (order.fill_price - pos.avg_price) * pos.quantity
+        is_long = (pos.direction == "LONG")
+        direction_mult = 1 if is_long else -1
+
+        # Direction-aware gross PnL:
+        #   LONG:  profit when exit > entry  → (exit - entry) * qty
+        #   SHORT: profit when exit < entry  → (entry - exit) * qty  = direction_mult * (exit - entry) * qty
+        gross_pnl = direction_mult * (order.fill_price - pos.avg_price) * pos.quantity
 
         # ── Indian transaction costs (government charges — always deducted) ─
         buy_charges  = _compute_charges(pos.avg_price,    pos.quantity, "BUY")
@@ -357,13 +401,14 @@ class PaperTrader:
 
         self.closed_trades.append({
             "ticker":        ticker,
+            "direction":     pos.direction,
             "entry_price":   pos.avg_price,
             "exit_price":    order.fill_price,
             "quantity":      pos.quantity,
             "gross_pnl":     round(gross_pnl, 2),
             "charges":       round(total_charges, 2),
             "pnl":           round(net_pnl, 2),    # NET (what you actually keep)
-            "pnl_pct":       round((order.fill_price / pos.avg_price - 1) * 100, 3),
+            "pnl_pct":       round(direction_mult * (order.fill_price / pos.avg_price - 1) * 100, 3),
             "entry_time":    pos.entry_time,
             "exit_time":     order.fill_time,
             "exit_reason":   order.notes or "SIGNAL",
@@ -373,9 +418,10 @@ class PaperTrader:
             },
         })
         logger.info(
-            f"  PaperSELL {ticker} × {pos.quantity} @ ₹{order.fill_price:,.2f} "
-            f"→ Gross ₹{gross_pnl:+,.0f}  Charges ₹{total_charges:,.0f}  "
-            f"Net ₹{net_pnl:+,.0f}"
+            f"  PaperCLOSE {ticker} [{pos.direction}] x {pos.quantity}"
+            f" @ Rs{order.fill_price:,.2f}"
+            f" -> Gross Rs{gross_pnl:+,.0f}  Charges Rs{total_charges:,.0f}"
+            f"  Net Rs{net_pnl:+,.0f}"
         )
         return net_pnl
 
@@ -385,7 +431,10 @@ class PaperTrader:
         if pos is None:
             return
 
-        gross_pnl = (price - pos.avg_price) * pos.quantity
+        is_long = (pos.direction == "LONG")
+        direction_mult = 1 if is_long else -1
+
+        gross_pnl = direction_mult * (price - pos.avg_price) * pos.quantity
         buy_charges  = _compute_charges(pos.avg_price, pos.quantity, "BUY")
         sell_charges = _compute_charges(price,         pos.quantity, "SELL")
         total_charges = buy_charges["total"] + sell_charges["total"]
@@ -393,13 +442,14 @@ class PaperTrader:
 
         self.closed_trades.append({
             "ticker":        ticker,
+            "direction":     pos.direction,
             "entry_price":   pos.avg_price,
             "exit_price":    price,
             "quantity":      pos.quantity,
             "gross_pnl":     round(gross_pnl, 2),
             "charges":       round(total_charges, 2),
             "pnl":           round(net_pnl, 2),
-            "pnl_pct":       round((price / pos.avg_price - 1) * 100, 3),
+            "pnl_pct":       round(direction_mult * (price / pos.avg_price - 1) * 100, 3),
             "entry_time":    pos.entry_time,
             "exit_time":     datetime.now(IST).isoformat(),
             "exit_reason":   reason,
@@ -407,16 +457,16 @@ class PaperTrader:
         del self.positions[ticker]
         self._save_ledger()
         logger.info(
-            f"  AUTO-EXIT {ticker} @ ₹{price:,.2f} ({reason}) "
-            f"Gross ₹{gross_pnl:+,.0f}  Charges ₹{total_charges:,.0f}  "
-            f"Net ₹{net_pnl:+,.0f}"
+            f"  AUTO-EXIT {ticker} [{pos.direction}] @ Rs{price:,.2f} ({reason})"
+            f" Gross Rs{gross_pnl:+,.0f}  Charges Rs{total_charges:,.0f}"
+            f"  Net Rs{net_pnl:+,.0f}"
         )
         if self.monitor:
-            emoji = "🛑" if "SL" in reason else ("🎯" if "TP" in reason else "🔄")
+            emoji = "stop" if "SL" in reason else ("target" if "TP" in reason else "cycle")
             self.monitor.send_message(
-                f"{emoji} <b>Paper {reason}</b> — {ticker}\n"
-                f"Exit: ₹{price:,.2f}  Gross: ₹{gross_pnl:+,.0f}\n"
-                f"Charges: ₹{total_charges:,.0f}  Net: ₹{net_pnl:+,.0f}"
+                f"Paper {reason} - {ticker} [{pos.direction}]\n"
+                f"Exit: Rs{price:,.2f}  Gross: Rs{gross_pnl:+,.0f}\n"
+                f"Charges: Rs{total_charges:,.0f}  Net: Rs{net_pnl:+,.0f}"
             )
         if self.risk:
             self.risk.record_trade_close(net_pnl, price * pos.quantity)
@@ -441,7 +491,13 @@ class PaperTrader:
             with open(LEDGER) as f:
                 data = json.load(f)
             for ticker, pd_data in data.get("positions", {}).items():
-                self.positions[ticker] = PaperPosition(**pd_data)
+                # Backwards compatibility: old ledger entries lack 'direction' and 'lowest_price'
+                pd_data.setdefault("direction",   "LONG")
+                pd_data.setdefault("lowest_price", pd_data.get("avg_price", 0.0))
+                # Only pass fields that exist in PaperPosition
+                valid = {k: v for k, v in pd_data.items()
+                         if k in PaperPosition.__dataclass_fields__}
+                self.positions[ticker] = PaperPosition(**valid)
             self.closed_trades = data.get("closed_trades", [])
             logger.info(f"Ledger loaded: {len(self.positions)} open, "
                         f"{len(self.closed_trades)} closed trades")

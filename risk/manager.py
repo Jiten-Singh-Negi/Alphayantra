@@ -24,8 +24,9 @@ from typing import Optional
 
 IST = ZoneInfo("Asia/Kolkata")
 
-RISK_CONFIG_FILE = Path("risk/config.json")
-RISK_STATE_FILE  = Path("risk/daily_state.json")
+RISK_CONFIG_FILE     = Path("risk/config.json")
+RISK_STATE_FILE      = Path("risk/daily_state.json")
+RISK_WEEK_STATE_FILE = Path("risk/weekly_state.json")   # week-level capital tracking
 
 
 @dataclass
@@ -140,6 +141,15 @@ class RiskManager:
             self._halt(f"Daily loss limit breached: ₹{st.pnl_today:,.0f}")
             return False, f"Daily loss limit reached (₹{daily_loss_limit:,.0f})"
 
+        # ── Weekly loss limit ─────────────────────────────────────────
+        # Uses peak_capital at start of week to compute weekly drawdown.
+        week_start_capital = self._get_week_start_capital()
+        if week_start_capital > 0 and st.current_capital > 0:
+            weekly_loss = (week_start_capital - st.current_capital) / week_start_capital
+            if weekly_loss > cfg.max_weekly_loss_pct:
+                self._halt(f"Weekly loss limit breached: {weekly_loss:.1%}")
+                return False, f"Weekly loss {weekly_loss:.1%} > limit {cfg.max_weekly_loss_pct:.0%}"
+
         # ── Drawdown check ────────────────────────────────────────────
         if st.peak_capital > 0:
             drawdown = (st.peak_capital - st.current_capital) / st.peak_capital
@@ -178,16 +188,37 @@ class RiskManager:
         stop_loss:  float,
         atr:        float,
         confidence: float,
+        direction:  str = "BUY",   # "BUY" or "SELL" — controls polarity
     ) -> int:
         """
         Calculate optimal position size using ATR-based risk.
         Risk per trade = 1% of capital.
-        Position size = Risk amount / (Entry - Stop Loss)
+        Position size = Risk amount / |Entry - Stop Loss|
 
-        Returns number of shares/lots.
+        BUG FIXED: The previous code used max(0.01, entry - stop_loss).
+        For a short trade (entry=100, stop_loss=105):
+          entry - stop_loss = 100 - 105 = -5
+          max(0.01, -5) = 0.01   ← defaulted to floor, ignored actual risk
+          qty = risk_per_trade / 0.01 = potentially 1,000,000 shares!
+          max_qty cap eventually caught it, but every short maxed out the limit.
+
+        FIX: Use abs(entry - stop_loss) — the MAGNITUDE of risk is always
+        positive regardless of trade direction.
         """
         risk_per_trade = capital * 0.01   # 1% risk per trade
-        risk_per_share = max(0.01, entry - stop_loss)
+
+        # CRITICAL: always take absolute value — short trades have entry < stop_loss
+        raw_risk = entry - stop_loss
+        if direction == "BUY":
+            # Long: stop_loss < entry, so raw_risk > 0 (usually)
+            # If for some reason stop_loss >= entry, that's a config error — use ATR fallback
+            risk_per_share = raw_risk if raw_risk > 0 else atr * 1.0
+        else:
+            # Short: stop_loss > entry, so raw_risk < 0; abs gives correct risk
+            risk_per_share = -raw_risk if raw_risk < 0 else atr * 1.0
+
+        # Final floor: risk can't be less than 0.1% of price (sanity bound)
+        risk_per_share = max(entry * 0.001, risk_per_share)
 
         # Base quantity from risk
         qty = int(risk_per_trade / risk_per_share)
@@ -197,7 +228,7 @@ class RiskManager:
         qty = int(qty * min(1.5, confidence_scalar))
 
         # Cap at max position size
-        max_qty = int((capital * self.config.max_position_size) / entry)
+        max_qty = int((capital * self.config.max_position_size) / max(entry, 0.01))
         return max(1, min(qty, max_qty))
 
     def kelly_fraction(
@@ -297,6 +328,34 @@ class RiskManager:
         logger.warning(f"⚠️  Trading halted: {reason}")
         self._save_state()
 
+    def _get_week_start_capital(self) -> float:
+        """
+        Return the capital at the start of the current ISO week.
+        Stored in RISK_WEEK_STATE_FILE.  Updated every Monday morning.
+        If no record exists (first week), returns total_capital as baseline.
+        """
+        try:
+            today = date.today()
+            iso_week = today.isocalendar()[:2]   # (year, week)
+            RISK_WEEK_STATE_FILE.parent.mkdir(exist_ok=True)
+            if RISK_WEEK_STATE_FILE.exists():
+                with open(RISK_WEEK_STATE_FILE) as f:
+                    wd = json.load(f)
+                stored_week = tuple(wd.get("iso_week", [0, 0]))
+                if tuple(stored_week) == iso_week:
+                    return float(wd.get("week_start_capital", self.config.total_capital))
+            # New week — record current capital as the week's starting equity
+            week_capital = self.state.current_capital or self.config.total_capital
+            with open(RISK_WEEK_STATE_FILE, "w") as f:
+                json.dump({
+                    "iso_week":           list(iso_week),
+                    "week_start_capital": week_capital,
+                    "recorded_at":        date.today().isoformat(),
+                }, f, indent=2)
+            return week_capital
+        except Exception:
+            return self.config.total_capital   # safe fallback
+
     def _load_config(self) -> RiskConfig:
         RISK_CONFIG_FILE.parent.mkdir(exist_ok=True)
         if RISK_CONFIG_FILE.exists():
@@ -311,14 +370,75 @@ class RiskManager:
             json.dump(asdict(self.config), f, indent=2)
 
     def _load_or_init_state(self) -> DailyState:
+        """
+        Load today's state or create a fresh daily state carrying forward capital.
+
+        BUG FIXED — Drawdown Amnesia:
+        ───────────────────────────────
+        OLD code: When the date changed, it threw away the old JSON state and
+        reset current_capital and peak_capital back to total_capital (₹10L).
+        If the model lost 2% per day for 10 days, real drawdown was 20%.
+        But every morning the system thought drawdown was 0% → kept trading.
+        The 15% max_drawdown rule was only acting as an intraday limit.
+
+        FIX: When creating a new day's state, we CARRY FORWARD:
+          - current_capital from yesterday's ending state (the actual equity)
+          - peak_capital from yesterday (must never decrease across days)
+        Only intraday counters (trades_today, pnl_today, capital_deployed,
+        open_positions, trading_halted) reset to zero / cleared at day start.
+
+        The drawdown rule now computes correctly across multiple weeks of losses.
+        """
         today = date.today().isoformat()
         RISK_STATE_FILE.parent.mkdir(exist_ok=True)
+
         if RISK_STATE_FILE.exists():
-            with open(RISK_STATE_FILE) as f:
-                d = json.load(f)
+            try:
+                with open(RISK_STATE_FILE) as f:
+                    d = json.load(f)
+            except Exception:
+                d = {}
+
             if d.get("date") == today:
-                return DailyState(**d)
-        # New day — reset state
+                # Same day — restore full state (all intraday counters intact)
+                return DailyState(**{k: v for k, v in d.items() if hasattr(DailyState, k)})
+            else:
+                # NEW DAY: reset intraday counters but carry forward equity state
+                # ──────────────────────────────────────────────────────────────
+                # current_capital: yesterday's closing equity (NOT starting capital)
+                prev_current = float(d.get("current_capital", self.config.total_capital))
+                # peak_capital: highest equity ever reached (never resets)
+                prev_peak    = float(d.get("peak_capital", self.config.total_capital))
+
+                # Sanity bounds: if prev values look corrupt (e.g. 0 or negative),
+                # fall back to total_capital so we don't lock trading forever.
+                if prev_current <= 0 or prev_current > self.config.total_capital * 10:
+                    prev_current = self.config.total_capital
+                if prev_peak < prev_current or prev_peak > self.config.total_capital * 10:
+                    prev_peak = max(prev_current, self.config.total_capital)
+
+                logger.info(
+                    f"New trading day {today} — "
+                    f"Carrying forward equity: ₹{prev_current:,.0f}  "
+                    f"Peak: ₹{prev_peak:,.0f}  "
+                    f"Drawdown: {(prev_peak - prev_current) / max(1, prev_peak):.1%}"
+                )
+
+                state = DailyState(
+                    date             = today,
+                    trades_today     = 0,
+                    pnl_today        = 0.0,
+                    capital_deployed = 0.0,
+                    open_positions   = 0,
+                    trading_halted   = False,   # intraday halt clears at day start
+                    halt_reason      = "",
+                    current_capital  = prev_current,  # ← CARRIED FORWARD
+                    peak_capital     = prev_peak,     # ← CARRIED FORWARD (never reset)
+                )
+                self._save_state(state)
+                return state
+
+        # First ever run — initialise from total_capital
         state = DailyState(
             date             = today,
             current_capital  = self.config.total_capital,

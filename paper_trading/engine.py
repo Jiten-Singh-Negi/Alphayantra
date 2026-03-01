@@ -210,7 +210,7 @@ class PaperTradingEngine:
         trade.gross_pnl    = round(gross, 2)
         trade.charges     += charges
         trade.net_pnl      = round(net, 2)
-        trade.pnl_pct      = round((exit_price / trade.entry_price - 1) * 100, 2)
+        trade.pnl_pct      = round((exit_price / trade.entry_price - 1) * 100 * (1 if trade.direction == "LONG" else -1), 2)
         trade.status       = "CLOSED"
         trade.unrealised_pnl = 0.0
 
@@ -266,7 +266,9 @@ class PaperTradingEngine:
                 if price <= 0:
                     continue
                 trade.current_price   = round(price, 2)
-                trade.unrealised_pnl  = round((price - trade.entry_price) * trade.quantity, 2)
+                # BUG-1 FIX: SHORT profits when price FALLS — multiply by direction sign
+                direction_mult        = 1 if trade.direction == "LONG" else -1
+                trade.unrealised_pnl  = round(direction_mult * (price - trade.entry_price) * trade.quantity, 2)
 
                 # Check barriers
                 if trade.direction == "LONG":

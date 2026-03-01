@@ -229,7 +229,7 @@ def train_model(skip_tcn: bool = False):
         skip_tcn           = skip_tcn,
         tcn_max_samples    = 50_000,
         tcn_epochs         = 10,
-        use_triple_barrier = True,
+        use_triple_barrier = False,  # v8 fix: triple-barrier produces near-random labels, use trend_quality instead
     )
 
     print(f"\nTraining complete! ✅")

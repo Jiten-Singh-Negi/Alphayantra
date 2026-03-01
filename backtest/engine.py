@@ -317,9 +317,19 @@ class BacktestEngine:
                     sl = float(row.get("stop_loss",  entry_price - sl_mult * atr))
                     tp = float(row.get("take_profit", entry_price + tp_mult * atr))
 
-                    charges  = self._compute_charges(quantity, entry_price, "BUY")
-                    charges += quantity * slippage_cost   # slippage counted as cost
-                    capital -= quantity * entry_price + self._compute_charges(quantity, entry_price, "BUY")
+                    # BUG FIX: Previously _compute_charges() was called TWICE:
+                    # once to populate trade.charges, and again in the capital
+                    # deduction line — double-counting every entry commission.
+                    # FIX: compute once, reuse the same value for both.
+                    entry_charges = self._compute_charges(quantity, entry_price, "BUY")
+                    slippage_rs   = quantity * slippage_cost   # slippage in ₹
+
+                    # Total charges booked against trade (commissions + slippage)
+                    charges = entry_charges + slippage_rs
+
+                    # Deduct from capital: share cost + commissions only (slippage
+                    # is already embedded in entry_price for cash flow purposes)
+                    capital -= quantity * entry_price + entry_charges
 
                     trade = Trade(
                         ticker          = ticker,
@@ -327,7 +337,7 @@ class BacktestEngine:
                         exit_date       = None,
                         entry_price     = entry_price,
                         entry_price_raw = raw_open,
-                        slippage_cost   = slippage_cost * quantity,
+                        slippage_cost   = slippage_rs,
                         exit_price      = None,
                         quantity        = quantity,
                         direction       = "LONG",
@@ -487,7 +497,7 @@ class BacktestEngine:
             sortino_ratio     = round(sortino, 3),
             calmar_ratio      = round(calmar, 3),
             max_drawdown_pct  = round(max_dd, 2),
-            max_drawdown_rs   = round(abs(drawdown.idxmin() and eq_series.max() - eq_series.min()), 2),
+            max_drawdown_rs   = round(abs(roll_max[drawdown.idxmin()] - eq_series[drawdown.idxmin()]), 2),
             win_rate          = round(win_rate, 4),
             avg_win_pct       = round(avg_win, 2),
             avg_loss_pct      = round(avg_loss, 2),

@@ -249,16 +249,17 @@ def get_news(ticker: str, hours: int = 24):
 @app.post("/predict")
 def predict(req: PredictRequest):
     """
-    ASGI FIX: plain `def`.
+    Scan tickers and return ML + technical predictions.
+
+    ASGI FIX: plain `def` (not async def).
     This endpoint loops over up to 200 stocks, each requiring a yfinance
     download (~1s I/O each) + model inference (~0.2s CPU each).
     Running it as `async def` would occupy the ASGI event loop for minutes,
     dropping all other requests. FastAPI's threadpool handles it correctly
     when defined as a plain synchronous function.
-    """
-    """
-    BUG FIX: now injects live VIX, ADX, PCR, IV Rank and FinBERT sentiment
-    into model.predict() instead of leaving all silo features at neutral defaults.
+
+    LIVE CONTEXT: injects real VIX, ADX, PCR, IV Rank and FinBERT sentiment
+    into model.predict() for every ticker — no neutral defaults.
     """
     model   = get_ml_model()
     tickers = req.tickers or UNIVERSE_MAP.get(req.universe, [])
@@ -511,7 +512,7 @@ async def train_model(req: TrainRequest, background_tasks: BackgroundTasks):
     if _training_status["status"] == "running":
         return {"status": "already_running", "progress": _training_status["progress"]}
 
-    async def _do_train():
+    def _do_train():
         global _training_status, _ml_model
         try:
             _training_status = {"status": "running", "progress": 5, "message": "Fetching stock data..."}

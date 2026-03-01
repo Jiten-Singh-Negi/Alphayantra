@@ -44,7 +44,7 @@ def main():
         skip_tcn           = False,        # False = train the TCN
         tcn_max_samples    = 50_000,
         tcn_epochs         = 10,
-        use_triple_barrier = True,
+        use_triple_barrier = False,  # v8 fix: trend_quality labels, not random triple-barrier
     )
 
     logger.info("\n Training complete!")

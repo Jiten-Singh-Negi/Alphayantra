@@ -139,7 +139,20 @@ def compute_indicators(df: pd.DataFrame, cfg: IndicatorConfig) -> pd.DataFrame:
         df["above_sma200"] = (close > df["sma200"]).astype(int)
 
     if cfg.use_vwap:
-        df["vwap"] = (close * vol).cumsum() / vol.cumsum()
+        # CRITICAL FIX: cumsum() VWAP over a multi-year DataFrame is meaningless.
+        # A daily bar does not have intraday tick volume — cumsum from 2010 to today
+        # gives a price from 2012 as VWAP when computed at a 2024 bar (dominated by
+        # early-year data). Also creates lookahead for early bars.
+        #
+        # FIX: Rolling 20-day VWAP approximation — each bar sees only the last 20
+        # days of (typical_price × volume) / volume. This is the standard approach
+        # for daily data and matches what a trader would actually reference.
+        #
+        # Typical price = (High + Low + Close) / 3 — better than Close alone
+        typical_price = (high + low + close) / 3
+        tpv_20 = (typical_price * vol).rolling(20, min_periods=5).sum()
+        vol_20 = vol.rolling(20, min_periods=5).sum()
+        df["vwap"] = (tpv_20 / vol_20.replace(0, np.nan)).fillna(close)
         df["above_vwap"] = (close > df["vwap"]).astype(int)
 
     # ── RSI ───────────────────────────────────────────────────────────
@@ -276,6 +289,7 @@ def compute_signal_score(row: pd.Series, cfg: IndicatorConfig) -> dict:
     """
     breakdown = {}
     confirmations = 0
+    bearish_confirmations = 0
 
     def _safe(key, default=np.nan):
         v = row.get(key, default)
@@ -292,6 +306,7 @@ def compute_signal_score(row: pd.Series, cfg: IndicatorConfig) -> dict:
             rsi_score = 0.6
         elif rsi_val > cfg.rsi_overbought:
             rsi_score = -1.0
+            bearish_confirmations += 1
         else:
             rsi_score = max(0, (50 - rsi_val) / 50)
         breakdown["rsi"] = round(rsi_score * cfg.weight_rsi * 100, 1)
@@ -306,6 +321,7 @@ def compute_signal_score(row: pd.Series, cfg: IndicatorConfig) -> dict:
             macd_score = 0.5
         elif _safe("macd_bearish") == 1:
             macd_score = -1.0
+            bearish_confirmations += 1
         breakdown["macd"] = round(macd_score * cfg.weight_macd * 100, 1)
 
     # Bollinger Band contribution
@@ -318,6 +334,7 @@ def compute_signal_score(row: pd.Series, cfg: IndicatorConfig) -> dict:
             bb_score = 0.6
         elif _safe("bb_touch_upper") == 1:
             bb_score = -1.0
+            bearish_confirmations += 1
         elif _safe("bb_squeeze") == 1:
             bb_score = 0.3      # Squeeze = imminent breakout
         breakdown["bb"] = round(bb_score * cfg.weight_bb * 100, 1)
@@ -350,6 +367,7 @@ def compute_signal_score(row: pd.Series, cfg: IndicatorConfig) -> dict:
             ema_score = 0.5
         elif _safe("ema_death") == 1:
             ema_score = -1.0
+            bearish_confirmations += 1
         breakdown["ema_trend"] = round(ema_score * cfg.weight_ema * 100, 1)
 
     # Total technical score (0–100 range)
@@ -372,7 +390,7 @@ def compute_signal_score(row: pd.Series, cfg: IndicatorConfig) -> dict:
         signal = "STRONG BUY"
     elif tech_score >= 60:
         signal = "BUY"
-    elif tech_score <= 25:
+    elif bearish_confirmations >= cfg.min_confirmations and tech_score <= 25:
         signal = "STRONG SELL"
     elif tech_score <= 40:
         signal = "SELL"

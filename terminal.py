@@ -1357,7 +1357,7 @@ def render_tick(tick_q: multiprocessing.Queue, feed_proc):
     _frame += 1
 
     # Always: drain feed queue (core data pipeline — never skip)
-    _drain_mp_queue(tick_q)
+    _drain_mp_queue(tick_q, max_items=100)
 
     # 10fps: lightweight gauge updates
     if _frame % 6 == 0:
