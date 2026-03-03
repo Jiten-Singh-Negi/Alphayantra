@@ -227,8 +227,8 @@ def train_model(skip_tcn: bool = False):
         all_stock_dfs      = processed,
         n_cv_folds         = 4,
         skip_tcn           = skip_tcn,
-        tcn_max_samples    = 50_000,
-        tcn_epochs         = 10,
+        tcn_max_samples    = 72_000,  # increased from 50k; per-stock sampling ensures coverage
+        tcn_epochs         = 100,  # v8.3: 100 epochs with early stopping (patience=5); typically converges in 30-50
         use_triple_barrier = False,  # v8 fix: triple-barrier produces near-random labels, use trend_quality instead
     )
 

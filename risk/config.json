@@ -1,0 +1,22 @@
+{
+  "total_capital": 1000000,
+  "max_capital_deployed": 0.8,
+  "max_position_size": 0.05,
+  "max_single_option": 0.03,
+  "max_daily_loss_pct": 0.02,
+  "max_weekly_loss_pct": 0.05,
+  "max_drawdown_pct": 0.15,
+  "max_open_positions": 10,
+  "max_options_positions": 5,
+  "max_trades_per_day": 20,
+  "max_sector_exposure": 0.25,
+  "no_new_trades_after": "15:00",
+  "no_options_after": "15:20",
+  "square_off_by": "15:25",
+  "max_option_loss_pct": 0.5,
+  "min_option_profit_pct": 0.3,
+  "max_iv_to_trade": 50.0,
+  "min_ml_confidence": 60.0,
+  "min_tech_score": 65.0,
+  "kill_switch": false
+}

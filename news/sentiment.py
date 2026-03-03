@@ -265,7 +265,7 @@ class NewsSentimentEngine:
 
     def _fetch_all_articles(self, ticker: str, hours_window: int) -> list:
         """Fetch from all RSS feeds concurrently with per-source timeout."""
-        cutoff   = datetime.now() - timedelta(hours=hours_window * 3)
+        cutoff   = datetime.now() - timedelta(hours=hours_window)
         articles = []
 
         futures = {

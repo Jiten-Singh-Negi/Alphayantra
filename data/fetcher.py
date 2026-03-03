@@ -125,26 +125,103 @@ UNIVERSE_MAP = {
 
 
 def _yf_symbol(ticker: str) -> str:
-    """Convert NSE symbol to Yahoo Finance format (append .NS)."""
+    """
+    Convert NSE internal symbol to Yahoo Finance ticker format.
+
+    Corrections verified from live fetch log (2026-03-02):
+      - Stocks that failed with yf.download() but work via yf.Ticker().history()
+        are handled by the fetch_ohlcv rewrite (Ticker API, not download API).
+      - Symbols that Yahoo Finance stores under a different string than NSE are
+        mapped explicitly here.
+      - ESCORTS renamed to ESCORTSKUBOTA after Kubota JV consolidation (2023).
+      - BERGERPAINTS: Yahoo uses BERGEPAINT (no S).
+      - M&M / BAJAJ-AUTO: special chars preserved — Yahoo accepts them fine.
+    """
     if "." in ticker:
         return ticker
-    special = {
-        "M&M":         "M&M.NS",
-        "BAJAJ-AUTO":  "BAJAJ-AUTO.NS",
-        "BERGERPAINTS":"BERGEPAINT.NS",
-        "BLUESTARCO":  "BLUESTARCO.NS",
-        "IPCALAB":     "IPCALAB.NS",
-        "DIXON":       "DIXON.NS",
-        "TVSMOTOR":    "TVSMOTOR.NS",
-        "LTIM":        "LTIM.NS",
-        "YESBANK":     "YESBANK.NS",
-        "IDEA":        "IDEA.NS",
-        "RCOM":        "RCOM.NS",
-        "SPICEJET":    "SPICEJET.NS",
+
+    # Verified NSE symbol → Yahoo Finance ticker corrections
+    # Key principle: Yahoo Finance uses the TRADING symbol on NSE, which sometimes
+    # differs from the commonly used short name.
+    SYMBOL_MAP = {
+        # Special characters
+        "M&M":            "M&M.NS",
+        "BAJAJ-AUTO":     "BAJAJ-AUTO.NS",
+
+        # Name changes / mergers (NSE internal name → current Yahoo ticker)
+        "BERGERPAINTS":   "BERGEPAINT.NS",     # Yahoo drops the S
+        "ESCORTS":        "ESCORTSKUBOTA.NS",   # renamed after Kubota merger 2023
+        "BERGER":         "BERGEPAINT.NS",
+
+        # Stocks that fail with yf.download() due to yfinance MultiIndex bug —
+        # these are fetched via yf.Ticker().history() in fetch_ohlcv, so the
+        # symbol just needs to be correct here
+        "SBIN":           "SBIN.NS",
+        "NTPC":           "NTPC.NS",
+        "HEROMOTOCO":     "HEROMOTOCO.NS",
+        "DIVISLAB":       "DIVISLAB.NS",
+        "TATACHEM":       "TATACHEM.NS",
+        "ASHOKLEY":       "ASHOKLEY.NS",
+        "SJVN":           "SJVN.NS",
+        "MOIL":           "MOIL.NS",
+        "DEEPAKNTR":      "DEEPAKNTR.NS",
+        "IPCALAB":        "IPCALAB.NS",
+        "VEDL":           "VEDL.NS",
+        "RCOM":           "RCOM.NS",
+        "RELIANCE":       "RELIANCE.NS",
+        "CDSL":           "CDSL.NS",
+        "NATIONALUM":     "NATIONALUM.NS",
+        "HINDUNILVR":     "HINDUNILVR.NS",
+        "WIPRO":          "WIPRO.NS",
+        "PIDILITIND":     "PIDILITIND.NS",
+        "TITAN":          "TITAN.NS",
+        "ASIANPAINT":     "ASIANPAINT.NS",
+        "CEAT":           "CEAT.NS",
+        "TATAMOTORS":     "TATAMOTORS.NS",
     }
-    if ticker in special:
-        return special[ticker]
+
+    if ticker in SYMBOL_MAP:
+        return SYMBOL_MAP[ticker]
     return f"{ticker}.NS"
+
+
+def _ticker_history(yf_sym: str, period: str, auto_adjust: bool) -> pd.DataFrame:
+    """
+    Robust single-stock OHLCV fetch using yf.Ticker().history().
+
+    WHY THIS INSTEAD OF yf.download():
+    ─────────────────────────────────────────────────────────────────────────
+    yf.download() has a persistent bug where for certain NSE symbols it returns
+    a MultiIndex DataFrame with empty levels, causing "No objects to concatenate"
+    inside yfinance itself. Confirmed failing stocks from live log:
+      SBIN, NTPC, HEROMOTOCO, DIVISLAB, TATACHEM, ASHOKLEY, SJVN, MOIL,
+      DEEPAKNTR, IPCALAB, VEDL, RCOM.
+
+    Additionally, yf.download(auto_adjust=True) sometimes returns an extra
+    'Adj Close' column causing duplicate column names after our renaming.
+    Confirmed failing: RELIANCE, CDSL, NATIONALUM, HINDUNILVR, WIPRO,
+    PIDILITIND, TITAN.
+
+    yf.Ticker(sym).history() ALWAYS returns a flat, clean DataFrame with no
+    MultiIndex, no extra columns, no NoneType errors.
+    ─────────────────────────────────────────────────────────────────────────
+    """
+    try:
+        tk   = yf.Ticker(yf_sym)
+        hist = tk.history(period=period, interval="1d", auto_adjust=auto_adjust)
+        if hist is None or hist.empty:
+            return pd.DataFrame()
+        # history() returns DatetimeIndex — normalise to UTC-naive
+        hist.index = pd.to_datetime(hist.index).tz_localize(None)
+        hist.index.name = "Date"
+        hist = hist.reset_index()
+        # Keep only standard OHLCV — drop Dividends, Stock Splits, Capital Gains
+        standard = ["Date", "Open", "High", "Low", "Close", "Volume"]
+        hist = hist[[c for c in standard if c in hist.columns]]
+        hist = hist.dropna(subset=["Close"])
+        return hist
+    except Exception:
+        return pd.DataFrame()
 
 
 def fetch_ohlcv(
@@ -154,102 +231,65 @@ def fetch_ohlcv(
     use_cache: bool = True,
 ) -> pd.DataFrame:
     """
-    Dual-track price fetcher — solves the fundamental indicator/options conflict.
+    Dual-track price fetcher v2 — uses yf.Ticker().history() for reliability.
 
-    THE PROBLEM (why the old single-track approach destroyed ML model quality):
-    ──────────────────────────────────────────────────────────────────────────
-    Indian stocks frequently undergo corporate actions: 1:1 bonus issues,
-    stock splits (2:1, 5:1, 10:1), rights issues. A 1:1 bonus drops the
-    unadjusted share price by exactly 50% in one day.
+    DUAL-TRACK DESIGN:
+    ─────────────────────────────────────────────────────────────────────────
+    Track A — Adjusted (Open, High, Low, Close, Volume):
+        auto_adjust=True: back-adjusted for all splits/bonuses.
+        Smooth continuous series — used by ALL indicators.
 
-    OLD approach (auto_adjust=False only):
-      - yfinance returns unadjusted OHLCV
-      - RSI sees a genuine 50% one-day drop → plunges to 2-5 (extreme oversold)
-      - MACD histogram: massive downward spike (fake death cross)
-      - Bollinger Bands: explode to 5× normal width for weeks
-      - ATR becomes enormous, making all subsequent stop-losses comically wide
-      - The ML model trains on thousands of these phantom "crashes" per stock
-        and learns absolutely nothing useful → AUC ~0.48 (worse than coin flip)
-
-    DUAL-TRACK FIX:
-    ──────────────────────────────────────────────────────────────────────────
-    Two separate downloads, kept as separate columns:
-
-    ADJUSTED columns  (Open, High, Low, Close, Volume):
-      auto_adjust=True — yfinance back-adjusts all history for every split/bonus
-      These are smooth, continuous series with no jump discontinuities
-      Used by: ALL indicators (RSI, MACD, EMA, ATR, Bollinger, ADX, etc.)
-
-    UNADJUSTED column (Close_Raw):
-      auto_adjust=False — raw NSE prices exactly as traded on that date
-      Used by: Bhavcopy options strike price matching ONLY
-      A ₹1000 strike in bhavcopy.db maps to ₹1000 raw price, not ₹100 adjusted
-
-    The result: indicators are computed on clean data, options silo features
-    are computed on matching raw data. Both are correct in their own domain.
+    Track B — Raw close (Close_Raw):
+        auto_adjust=False: exact NSE price as traded.
+        Used ONLY for Bhavcopy options strike matching.
 
     Returns DataFrame with columns:
         Date, Open, High, Low, Close, Volume, Close_Raw, Ticker
     """
-    cache_file = CACHE_DIR / f"{ticker}_{period}_{interval}_dualtrack.parquet"
+    # Cache key uses _v2 suffix so stale v1 caches (which caused duplicate
+    # Close_Raw bugs) are automatically bypassed without manual deletion.
+    cache_file = CACHE_DIR / f"{ticker}_{period}_{interval}_v2.parquet"
 
     if use_cache and cache_file.exists():
         age_hours = (time.time() - cache_file.stat().st_mtime) / 3600
         if age_hours < 24:
             logger.debug(f"Cache hit: {ticker}")
-            return pd.read_parquet(cache_file)
+            df = pd.read_parquet(cache_file)
+            if "Close_Raw" in df.columns and not df.empty:
+                return df
 
     yf_sym = _yf_symbol(ticker)
     try:
         # ── Track A: adjusted prices (for indicators) ──────────────────
-        adj = yf.download(
-            yf_sym,
-            period=period,
-            interval=interval,
-            auto_adjust=True,       # smooth, continuous — correct for indicators
-            progress=False,
-        )
+        adj = _ticker_history(yf_sym, period, auto_adjust=True)
         if adj.empty:
             logger.warning(f"No data returned for {ticker} ({yf_sym})")
             return pd.DataFrame()
 
-        if isinstance(adj.columns, pd.MultiIndex):
-            adj.columns = adj.columns.get_level_values(0)
-        adj = adj.reset_index()
-        adj.columns = [c.strip() for c in adj.columns]
-        col_map = {"Datetime": "Date", "datetime": "Date"}
-        adj.rename(columns=col_map, inplace=True)
-        keep = [c for c in ["Date", "Open", "High", "Low", "Close", "Volume"]
-                if c in adj.columns]
-        adj = adj[keep].dropna(subset=["Close"])
         adj["Date"] = pd.to_datetime(adj["Date"])
+        # Defensive: remove any Close_Raw that might exist from a bad cache read
+        adj = adj[[c for c in adj.columns if c != "Close_Raw"]]
 
         # ── Track B: raw unadjusted close (for options strike matching) ─
         try:
-            raw = yf.download(
-                yf_sym,
-                period=period,
-                interval=interval,
-                auto_adjust=False,     # exact historical price for strike matching
-                progress=False,
-            )
-            if isinstance(raw.columns, pd.MultiIndex):
-                raw.columns = raw.columns.get_level_values(0)
-            raw = raw.reset_index()
-            raw.columns = [c.strip() for c in raw.columns]
-            raw.rename(columns={"Datetime": "Date", "datetime": "Date"}, inplace=True)
+            raw = _ticker_history(yf_sym, period, auto_adjust=False)
+            if raw.empty:
+                raise ValueError("empty raw track")
             raw["Date"] = pd.to_datetime(raw["Date"])
             raw = raw[["Date", "Close"]].rename(columns={"Close": "Close_Raw"})
-            raw = raw.dropna(subset=["Close_Raw"])
         except Exception as e:
             logger.debug(f"Raw track failed for {ticker}: {e} — using adjusted as fallback")
             raw = adj[["Date", "Close"]].rename(columns={"Close": "Close_Raw"})
 
-        # ── Merge both tracks on Date ───────────────────────────────────
+        # ── Merge ──────────────────────────────────────────────────────
         df = adj.merge(raw, on="Date", how="left")
         df["Close_Raw"] = df["Close_Raw"].ffill().fillna(df["Close"])
-        df["Ticker"] = ticker
+        df["Ticker"]    = ticker
         df = df.sort_values("Date").reset_index(drop=True)
+
+        # Final safety: remove any accidental duplicate columns
+        if df.columns.duplicated().any():
+            df = df.loc[:, ~df.columns.duplicated()]
 
         df.to_parquet(cache_file, index=False)
         logger.info(f"Fetched {len(df)} rows for {ticker} (dual-track: adjusted + raw)")
@@ -258,6 +298,8 @@ def fetch_ohlcv(
     except Exception as e:
         logger.error(f"Failed to fetch {ticker}: {e}")
         return pd.DataFrame()
+
+
 
 
 def fetch_universe(
@@ -285,22 +327,53 @@ def fetch_universe(
     tickers = UNIVERSE_MAP.get(universe, NIFTY_50)
     logger.info(f"Fetching {len(tickers)} stocks for universe '{universe}'...")
 
-    results = {}
-    def _fetch_one(t):
+    results    = {}
+    failed     = []   # first-pass failures to retry
+    n_total    = len(tickers)
+
+    def _fetch_one(t: str, attempt: int = 1) -> tuple:
+        """Fetch with one silent retry on empty result (handles transient timeouts)."""
         df = fetch_ohlcv(t, period=period)
+        if df.empty and attempt == 1:
+            time.sleep(2)   # brief back-off before retry
+            df = fetch_ohlcv(t, period=period, use_cache=False)
         return t, df
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    # Reduced workers (4) to avoid yfinance rate limiting — the log showed
+    # many concurrent failures that are rate-limit artefacts, not real failures.
+    effective_workers = min(max_workers, 4)
+    logger.info(f"Using {effective_workers} workers (rate-limit safe)...")
+
+    with ThreadPoolExecutor(max_workers=effective_workers) as ex:
         futures = {ex.submit(_fetch_one, t): t for t in tickers}
+        done = 0
         for fut in as_completed(futures):
             ticker, df = fut.result()
+            done += 1
             if not df.empty and len(df) >= 200:
                 results[ticker] = df
             elif not df.empty:
                 logger.warning(f"  {ticker}: only {len(df)} days — skipped (need ≥200)")
-            # Fully delisted with no data — silently skipped (empty DataFrame)
+            else:
+                failed.append(ticker)
+            if done % 20 == 0:
+                logger.info(f"  Progress: {done}/{n_total} fetched, {len(results)} OK so far")
 
-    logger.info(f"Successfully fetched {len(results)}/{len(tickers)} stocks")
+    # Second-pass retry for any that failed — sequential with 1s gap each
+    if failed:
+        logger.info(f"Retrying {len(failed)} failed tickers sequentially...")
+        for ticker in failed:
+            time.sleep(1)
+            df = fetch_ohlcv(ticker, period=period, use_cache=False)
+            if not df.empty and len(df) >= 200:
+                results[ticker] = df
+                logger.info(f"  Retry OK: {ticker} ({len(df)} rows)")
+            elif not df.empty:
+                logger.warning(f"  Retry {ticker}: only {len(df)} days — skipped")
+            else:
+                logger.debug(f"  Retry failed: {ticker} — likely delisted/unavailable")
+
+    logger.info(f"Successfully fetched {len(results)}/{n_total} stocks")
     return results
 
 

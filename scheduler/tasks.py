@@ -78,6 +78,10 @@ class AlphaYantraScheduler:
         self.ctx     = app_context
         self.running = False
         self._last_intraday = 0.0   # rate-limit intraday refresh
+        # FIX (v8.4): Lock for thread-safe access to shared ctx dict.
+        # _weekly_retrain writes ctx["ml_model"] from a background thread;
+        # other threads may read it concurrently via ctx.get("ml_model").
+        self._ctx_lock = threading.Lock()
 
     def start(self):
         self._register_schedules()
@@ -238,11 +242,15 @@ class AlphaYantraScheduler:
                 all_stock_dfs      = processed,
                 n_cv_folds         = 4,
                 skip_tcn           = False,
-                tcn_max_samples    = 50_000,
-                tcn_epochs         = 10,
+                tcn_max_samples    = 72_000,  # increased from 50k; per-stock sampling ensures coverage
+                tcn_epochs         = 75,  # v8.3: 75 epochs with early stopping (patience=5); typically converges in 30-50
                 use_triple_barrier = False,  # v8 fix: triple-barrier produces near-random labels, use trend_quality instead
             )
-            self.ctx["ml_model"] = model
+            # FIX (v8.4): Atomically swap the model reference under lock so
+            # readers (e.g. _intraday_refresh → signal_engine → model.predict)
+            # never see a half-assigned object.
+            with self._ctx_lock:
+                self.ctx["ml_model"] = model
 
             msg = (
                 f"✅ Weekly retrain complete!\n"
@@ -265,7 +273,9 @@ class AlphaYantraScheduler:
             return
         logger.info("Monthly feature importance report...")
         try:
-            model   = self.ctx.get("ml_model")
+            # FIX (v8.4): Read model under lock for thread-safety
+            with self._ctx_lock:
+                model = self.ctx.get("ml_model")
             monitor = self.ctx.get("monitor")
             if model and model.trained:
                 importance = model.get_feature_importance()

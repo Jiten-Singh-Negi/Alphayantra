@@ -104,7 +104,7 @@ def dwt_denoise_causal(
 
             try:
                 coeffs = pywt.wavedec(window_prices, wavelet, level=level,
-                                      mode="periodization")
+                                      mode="reflect")
                 # Zero finest detail band (highest freq = noise)
                 coeffs[-1][:] = 0.0
                 # Soft-threshold next band
@@ -112,7 +112,7 @@ def dwt_denoise_causal(
                 sigma         = med / 0.6745
                 threshold     = sigma * np.sqrt(2 * np.log(max(L, 2)))
                 coeffs[-2]    = pywt.threshold(coeffs[-2], threshold, mode="soft")
-                recon         = pywt.waverec(coeffs, wavelet, mode="periodization")
+                recon         = pywt.waverec(coeffs, wavelet, mode="reflect")
                 # Last element = row t's causal denoised price
                 filtered[t]   = float(recon[min(L - 1, len(recon) - 1)])
             except Exception:

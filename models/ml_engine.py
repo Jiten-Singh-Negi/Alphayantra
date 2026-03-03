@@ -197,6 +197,9 @@ FEATURE_COLS = [
     # ── D6: Regime Detection ─────────────────────────────────────────
     "hurst_exponent_20",   # Variance-ratio Hurst (~20d): >0.5 trending, <0.5 mean-reverting
     "trend_efficiency",    # |net_20d_move| / sum(|daily_moves|) — directional efficiency ratio
+
+    # ── D7: Liquidity Sweep (Stop Hunts) ─────────────────────────────
+    "liquidity_sweep",     # +vol for bull sweep, -vol for bear sweep, 0 = none
 ]
 
 
@@ -753,7 +756,7 @@ def tcn_predict_batched(
             del batch
 
     pred_arr = np.concatenate(preds) if preds else np.array([])
-    indices  = np.arange(seq_len, seq_len + len(pred_arr))
+    indices  = np.arange(seq_len-1, seq_len-1 + len(pred_arr))
     return pred_arr, indices
 
 
@@ -1195,6 +1198,22 @@ def engineer_features(
     sum_abs  = close.diff().abs().rolling(20, min_periods=5).sum().replace(0, np.nan)
     df["trend_efficiency"] = (net_20d / sum_abs).fillna(0.5).clip(0, 1)
 
+    # ── 17. Liquidity Sweep (Stop Hunt Detection) ──────────────────────
+    # Institutions often sweep retail stop-losses before reversing.
+    # Bullish sweep: Low breaches 20d low but Close recovers above it.
+    # Bearish sweep: High breaches 20d high but Close rejects below it.
+    # shift(1) ensures we compare against PRIOR 20 days, not including today.
+    roll_low_20  = low.rolling(20, min_periods=10).min().shift(1)
+    roll_high_20 = high.rolling(20, min_periods=10).max().shift(1)
+
+    bull_sweep = (low < roll_low_20) & (close > roll_low_20)    # breached low, recovered
+    bear_sweep = (high > roll_high_20) & (close < roll_high_20)  # breached high, rejected
+
+    # Combine: +1 bull, -1 bear, 0 none; weighted by vol_ratio for institutional conviction
+    sweep_raw = bull_sweep.astype(float) - bear_sweep.astype(float)
+    vol_multiplier = df["vol_ratio"] if "vol_ratio" in df.columns else 1.0
+    df["liquidity_sweep"] = (sweep_raw * vol_multiplier).fillna(0).clip(-5, 5)
+
     # ══════════════════════════════════════════════════════════════════
 
     # ── 14. Fill all feature cols with 0 (no bfill, no ffill) ─────────
@@ -1252,7 +1271,7 @@ def purged_walk_forward_split(
 
     sorted_dates = sorted(all_dates)
     n_dates = len(sorted_dates)
-    window_size = n_dates // (n_splits + 1)
+    window_size = n_dates // (n_splits + 2)  # +2 ensures all n_splits folds fit within date range
 
     splits = []
     for fold in range(n_splits):
@@ -1513,18 +1532,38 @@ class AlphaYantraML:
             logger.info(f"  Walk-forward mean AUC: {np.mean(fold_aucs):.3f} ± {np.std(fold_aucs):.3f}")
 
         # ── Phase 3: Final model training on full dataset ──────────────
+        # CRITICAL FIX: 3-way split (train/val/test) to prevent early-stopping
+        # leakage. Early stopping uses VAL set; final AUC is on untouched TEST.
         logger.info("Training final models on full dataset...")
-        X_all, y_all, y_sharpe_all = self._build_full_dataset(processed, use_triple_barrier)
+
+        # First pass: build date-sorted arrays to determine the global cutoff date
+        X_all, y_all, y_sharpe_all, row_ids_all = self._build_full_dataset(processed, use_triple_barrier)
+        n = len(X_all)
+        train_end = int(n * 0.70)
+        val_end   = int(n * 0.85)
+
+        # DATE LEAKAGE FIX (v8.5): Compute global date cutoff from the
+        # date-sorted row_ids. val_end is the boundary between val and test
+        # for tabular models — use the SAME date for per-stock TCN splits.
+        global_test_cutoff = row_ids_all[val_end][1]   # date from (ticker, date) tuple
+        logger.info(f"  Global test cutoff date: {global_test_cutoff}")
+
+        # Second pass: rebuild per-stock TCN arrays using the global date cutoff
+        X_all, y_all, y_sharpe_all, row_ids_all = self._build_full_dataset(
+            processed, use_triple_barrier, global_test_cutoff=global_test_cutoff
+        )
         pos_rate = float(y_all.mean())
         logger.info(f"  Dataset: {X_all.shape[0]:,} samples, {X_all.shape[1]} features")
         logger.info(f"  Positive rate: {pos_rate:.1%}")
 
-        split_idx = int(len(X_all) * 0.8)
         self.scaler = StandardScaler()
-        X_tr_s = self.scaler.fit_transform(X_all[:split_idx]).astype(np.float32)
-        X_te_s = self.scaler.transform(X_all[split_idx:]).astype(np.float32)
-        y_tr, y_te           = y_all[:split_idx], y_all[split_idx:]
-        y_sharpe_tr, y_sharpe_te = y_sharpe_all[:split_idx], y_sharpe_all[split_idx:]
+        X_tr_s  = self.scaler.fit_transform(X_all[:train_end]).astype(np.float32)
+        X_val_s = self.scaler.transform(X_all[train_end:val_end]).astype(np.float32)
+        X_te_s  = self.scaler.transform(X_all[val_end:]).astype(np.float32)
+        y_tr,  y_val,  y_te           = y_all[:train_end], y_all[train_end:val_end], y_all[val_end:]
+        y_sharpe_tr, y_sharpe_val, y_sharpe_te = y_sharpe_all[:train_end], y_sharpe_all[train_end:val_end], y_sharpe_all[val_end:]
+        row_ids_te = row_ids_all[val_end:]   # (ticker, date) for each test row
+        logger.info(f"  Split: train={len(X_tr_s):,}  val={len(X_val_s):,}  test={len(X_te_s):,}")
 
         # ── Random Forest ──────────────────────────────────────────────
         logger.info("Training Random Forest...")
@@ -1554,7 +1593,7 @@ class AlphaYantraML:
             )
             self.lgb_clf.fit(
                 X_tr_s, y_tr.astype(int),
-                eval_set=[(X_te_s, y_te.astype(int))],
+                eval_set=[(X_val_s, y_val.astype(int))],
                 callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
             )
             lgb_pred = self.lgb_clf.predict_proba(X_te_s)[:, 1]
@@ -1573,7 +1612,7 @@ class AlphaYantraML:
             random_state=42, n_jobs=-1, tree_method="hist", verbosity=0,
         )
         self.xgb_clf.fit(X_tr_s, y_tr.astype(int),
-                         eval_set=[(X_te_s, y_te.astype(int))], verbose=False)
+                         eval_set=[(X_val_s, y_val.astype(int))], verbose=False)
         xgb_pred = self.xgb_clf.predict_proba(X_te_s)[:, 1]
         xgb_auc  = roc_auc_score(y_te, xgb_pred)
         logger.info(f"XGB → AUC: {xgb_auc:.3f}  Acc: {accuracy_score(y_te, xgb_pred>0.5):.1%}")
@@ -1587,7 +1626,7 @@ class AlphaYantraML:
             random_state=42, n_jobs=-1, tree_method="hist", verbosity=0,
         )
         self.xgb_reg.fit(X_tr_s, y_sharpe_tr,
-                         eval_set=[(X_te_s, y_sharpe_te)], verbose=False)
+                         eval_set=[(X_val_s, y_sharpe_val)], verbose=False)
         sharpe_pred = self.xgb_reg.predict(X_te_s)
         sharpe_corr = np.corrcoef(y_sharpe_te, sharpe_pred)[0, 1]
         logger.info(f"XGB-R → Sharpe corr: {sharpe_corr:.3f}")
@@ -1603,64 +1642,75 @@ class AlphaYantraML:
             epochs=tcn_epochs, batch_size=512, ram_gb=ram, skip=skip_tcn,
         )
 
-        # ── Collect TCN out-of-fold predictions for stacking ──────────
-        # We get TCN test-set predictions here (they serve as hold-out OOF
-        # since we train on X_tr_s and predict on X_te_s — same split as
-        # the tabular models). These are then passed into the meta-learner
-        # so it learns the optimal RF/LGB/XGB/TCN blend from data.
-        oof_preds_tcn = []
-        if self.tcn_trained:
-            logger.info("  Collecting TCN OOF predictions for stacking meta-learner...")
-            for i, (oof_rf_fold, oof_labels_fold) in enumerate(zip(oof_preds_rf, oof_labels)):
-                # Use the final trained TCN to generate fold-level OOF predictions
-                # (same length as the tabular OOF — we subsample to match)
-                n_oof = len(oof_rf_fold)
-                n_avail = len(X_te_s) - tcn_seq_len
-                if n_avail <= 0:
-                    oof_preds_tcn.append(np.full(n_oof, 0.5))
-                    continue
-                # Sample evenly spaced indices from TCN test predictions
-                tcn_arr, tcn_indices = tcn_predict_batched(
-                    self.tcn_model, X_te_s, tcn_seq_len, batch_size=256
-                )
-                if len(tcn_arr) >= n_oof:
-                    step = max(1, len(tcn_arr) // n_oof)
-                    oof_preds_tcn.append(tcn_arr[::step][:n_oof])
-                else:
-                    # Pad with 0.5 if TCN produced fewer predictions than RF
-                    padded = np.full(n_oof, 0.5)
-                    padded[:len(tcn_arr)] = tcn_arr
-                    oof_preds_tcn.append(padded)
+        # ── TCN is NOT included in the Meta-Learner ────────────────────
+        # DESIGN FIX (v8.5): Tabular models (RF/XGB/LGB) and the sequential
+        # model (TCN) require fundamentally different cross-validation
+        # strategies (date-cutoff walk-forward vs. per-stock chronological).
+        # Feeding constant-0.5 TCN OOF into the meta makes LogisticRegression
+        # assign weight=0 to TCN → TCN is silently ignored at inference.
+        # CORRECT ARCHITECTURE: Meta-learner optimizes the TABULAR blend,
+        # then the ensemble AUC / predict() dynamically blends that result
+        # with TCN using regime_weights.
 
-        # ── Stacking Meta-Learner (now includes TCN) ───────────────────
-        # Meta-learner learns optimal RF / LGB / XGB / TCN blend from OOF data.
-        # Training this AFTER TCN means it can include TCN's contribution.
-        logger.info("Training stacking meta-learner (RF + LGB + XGB + TCN)...")
+        # ── Stacking Meta-Learner (TABULAR ONLY — no TCN) ──────────────
+        # Meta-learner learns optimal RF / LGB / XGB blend from OOF data.
+        # TCN is blended separately via regime weights.
+        logger.info("Training stacking meta-learner (RF + LGB + XGB)...")
         self.meta_learner = self._train_meta_learner(
             oof_preds_rf, oof_preds_xgb, oof_preds_lgb,
-            oof_preds_tcn if self.tcn_trained else [],
             oof_labels,
         )
 
         # ── Final ensemble AUC ─────────────────────────────────────────
+        # DESIGN FIX (v8.5): Meta-learner produces TABULAR blend, then we
+        # dynamically blend with TCN using regime weights — same as predict().
         all_preds = [rf_pred, xgb_pred]
         if lgb_pred is not None:
             all_preds.append(lgb_pred)
 
-        if self.tcn_trained:
-            tcn_pred_arr, tcn_idx = tcn_predict_batched(self.tcn_model, X_te_s, tcn_seq_len)
-            align = len(tcn_pred_arr)
-            base_preds = np.column_stack([p[-align:] for p in all_preds] + [tcn_pred_arr])
-        else:
-            base_preds = np.column_stack(all_preds)
-            align = len(rf_pred)
-
-        y_ens_labels = y_te[-align:]
-
+        # Step 1: Get tabular ensemble probability
+        base_preds = np.column_stack(all_preds)
         if self.meta_learner is not None:
-            ens = self.meta_learner.predict_proba(base_preds[:, :self._meta_n_features()])[:, 1]
+            tabular_ens = self.meta_learner.predict_proba(base_preds)[:, 1]
         else:
-            ens = base_preds.mean(axis=1)
+            tabular_ens = base_preds.mean(axis=1)
+
+        # Step 2: Blend with TCN via regime weights (if TCN trained)
+        if self.tcn_trained:
+            # Build lookup: (ticker, date) → TCN prediction
+            tcn_lookup = {}   # {(ticker, date): prob}
+            stock_test_final = getattr(self, '_tcn_stock_test', {})
+            stock_test_dates = getattr(self, '_tcn_stock_test_dates', {})
+            if stock_test_final:
+                for ticker, (F_t, _) in stock_test_final.items():
+                    if len(F_t) < tcn_seq_len + 5:
+                        continue
+                    p, ix = tcn_predict_batched(self.tcn_model, F_t, tcn_seq_len, 256)
+                    dates_t = stock_test_dates.get(ticker)
+                    if dates_t is not None and len(p) > 0:
+                        for j, pred_val in enumerate(p):
+                            date_j = ix[j]  # index within per-stock test array
+                            if date_j < len(dates_t):
+                                tcn_lookup[(ticker, dates_t[date_j])] = float(pred_val)
+
+            # Align: for each tabular test row, look up matching TCN prediction
+            tcn_aligned = np.full(len(rf_pred), 0.5)   # neutral fallback
+            matched = 0
+            for i, (ticker, dt) in enumerate(row_ids_te):
+                key = (ticker, dt)
+                if key in tcn_lookup:
+                    tcn_aligned[i] = tcn_lookup[key]
+                    matched += 1
+            logger.info(f"  TCN alignment: {matched:,}/{len(rf_pred):,} rows matched ({matched/max(1,len(rf_pred))*100:.1f}%)")
+
+            # Blend: tabular_ens * (1 - tcn_weight) + tcn * tcn_weight
+            # Use a moderate fixed TCN blend weight for training AUC evaluation
+            tcn_blend_w = 0.20   # conservative blend for eval
+            ens = tabular_ens * (1 - tcn_blend_w) + tcn_aligned * tcn_blend_w
+        else:
+            ens = tabular_ens
+
+        y_ens_labels = y_te
 
         ens_auc = roc_auc_score(y_ens_labels, ens)
         ens_acc = accuracy_score(y_ens_labels, ens > 0.5)
@@ -1740,49 +1790,45 @@ class AlphaYantraML:
             with torch.no_grad():
                 tcn_p = float(self.tcn_model(seq).item())
 
-        # ── Ensemble via meta-learner + regime-weighted TCN blend ──────
+        # ── Ensemble via meta-learner (TABULAR) + regime-weighted TCN ───
         #
-        # BUG FIXED: Previously, when meta_learner was present the code
-        # DROPPED tcn_p entirely. The if/elif structure meant TCN was only
-        # used as a fallback when meta_learner was absent — opposite of intent.
-        #
-        # CORRECT DESIGN:
-        #   1. Meta-learner was trained WITH TCN OOF predictions (since training
-        #      now runs TCN first, then meta). So meta_row must include tcn_p.
-        #   2. If TCN is unavailable at inference (e.g. sequence too short),
-        #      we pad with 0.5 (neutral prior) — meta-learner handles this gracefully
-        #      since 0.5 was the fallback value used during training on short folds.
+        # DESIGN FIX (v8.5): Meta-learner is trained on RF/XGB/LGB only.
+        # TCN uses a fundamentally different CV strategy (per-stock temporal)
+        # so it cannot produce valid OOF predictions for the tabular meta.
+        # Instead, we let the meta-learner optimize the tabular blend,
+        # then dynamically blend that result with TCN using regime weights.
         #
         if self.meta_learner is not None:
-            # Build meta-row in same order as training: RF, XGB, [LGB], [TCN]
+            # Build meta-row: RF, XGB, [LGB] — NO TCN
             meta_row = [rf_p, xgb_p]
-            if lgb_p is not None and self._meta_n_features() >= 3:
-                meta_row.append(lgb_p)
-            if self._meta_n_features() >= (3 + int(lgb_p is not None)):
-                # TCN slot: use actual prediction if available, else neutral 0.5
-                meta_row.append(tcn_p if tcn_p is not None else 0.5)
+            if self._meta_n_features() >= 3:
+                if lgb_p is not None:
+                    meta_row.append(lgb_p)
+                else:
+                    logger.warning("⚠️ Meta-learner expects LGB but lgb_p is None! Padding with neutral 0.5.")
+                    meta_row.append(0.5)
             # Pad or clip to exact expected count
             while len(meta_row) < self._meta_n_features():
+                logger.warning(f"⚠️ Padding meta_row: expected {self._meta_n_features()}, got {len(meta_row)}")
                 meta_row.append(0.5)
             meta_row = meta_row[:self._meta_n_features()]
-            prob = float(self.meta_learner.predict_proba(
+            prob_tabular = float(self.meta_learner.predict_proba(
                 np.array(meta_row).reshape(1, -1)
             )[0, 1])
-        elif tcn_p is not None:
-            # No meta-learner: regime-adaptive blend with TCN
+        else:
+            # Fallback: regime-weighted average of tabular models
             preds   = [rf_p, xgb_p]
             weights = [regime.rf_weight, regime.xgb_weight]
             if lgb_p is not None:
                 preds.append(lgb_p)
                 weights.append(regime.xgb_weight * 0.8)
-            prob_no_tcn = sum(p * w for p, w in zip(preds, weights)) / sum(weights)
-            prob = prob_no_tcn * (1 - regime.tcn_weight) + tcn_p * regime.tcn_weight
+            prob_tabular = sum(p * w for p, w in zip(preds, weights)) / sum(weights)
+
+        # Blend tabular with TCN via regime weights
+        if tcn_p is not None:
+            prob = prob_tabular * (1 - regime.tcn_weight) + tcn_p * regime.tcn_weight
         else:
-            # Fallback: simple average of available tabular models
-            preds = [rf_p, xgb_p]
-            if lgb_p is not None:
-                preds.append(lgb_p)
-            prob = float(np.mean(preds))
+            prob = prob_tabular
 
         # Kelly sizing
         daily_vol      = float(df["realized_vol_20d"].iloc[-1]) if "realized_vol_20d" in df.columns else 0.015
@@ -1796,6 +1842,9 @@ class AlphaYantraML:
             "SELL"        if prob <= 0.45 else
             "HOLD"
         )
+
+        # Read latest liquidity sweep from engineered features
+        sweep_val = float(df["liquidity_sweep"].iloc[-1]) if "liquidity_sweep" in df.columns else 0.0
 
         return {
             "probability":      round(prob, 4),
@@ -1813,6 +1862,7 @@ class AlphaYantraML:
             "tcn_prob":         round(tcn_p, 4) if tcn_p is not None else None,
             "tcn_used":         self.tcn_trained,
             "meta_stacking":    self.meta_learner is not None,
+            "liquidity_sweep":  round(sweep_val, 3),
             "ensemble_weights": {
                 "rf":  regime.rf_weight,
                 "xgb": regime.xgb_weight,
@@ -1861,17 +1911,17 @@ class AlphaYantraML:
             use_triple_barrier = use_triple_barrier,
         )
 
-    def _train_meta_learner(self, oof_rf, oof_xgb, oof_lgb, oof_tcn, oof_labels):
+    def _train_meta_learner(self, oof_rf, oof_xgb, oof_lgb, oof_labels):
         """
         Train a logistic regression stacking meta-learner on out-of-fold predictions.
 
-        Inputs are OOF predictions from RF, XGB, LGB (from walk-forward CV), and
-        optionally TCN (from test-set predictions aligned to same folds).
+        DESIGN FIX (v8.5): TABULAR ONLY — RF, XGB, LGB.  TCN is excluded
+        because its per-stock temporal CV cannot produce valid OOF predictions
+        aligned with the walk-forward date-cutoff folds used by tabular models.
+        Feeding constant-0.5 OOF gave the TCN column zero variance →
+        LogisticRegression assigned weight=0, silently killing TCN.
 
-        The meta-learner learns optimal combination from data rather than
-        relying on fixed weights. Training WITH TCN predictions is critical —
-        previously the meta was trained without TCN, meaning TCN was completely
-        orphaned in both training and inference.
+        TCN is blended with the meta output via regime weights in predict().
         """
         if not oof_rf or not oof_labels:
             logger.warning("Stacking: no OOF predictions available — skipping")
@@ -1883,8 +1933,6 @@ class AlphaYantraML:
                 row = [oof_rf[i], oof_xgb[i]]
                 if oof_lgb and i < len(oof_lgb):
                     row.append(oof_lgb[i])
-                if oof_tcn and i < len(oof_tcn):
-                    row.append(oof_tcn[i])
                 X_meta.append(np.column_stack(row))
 
             X_meta = np.vstack(X_meta)
@@ -1897,7 +1945,6 @@ class AlphaYantraML:
 
             coef_labels = ["RF", "XGB"]
             if X_meta.shape[1] >= 3: coef_labels.append("LGB")
-            if X_meta.shape[1] >= 4: coef_labels.append("TCN")
             coef_str = "  ".join(f"{l}={c:.3f}" for l, c in zip(coef_labels, meta.coef_[0]))
             logger.info(f"Meta-learner → in-sample AUC: {meta_auc:.3f} | n_features={self._meta_features}")
             logger.info(f"  Base model weights: {coef_str}")
@@ -1984,10 +2031,33 @@ class AlphaYantraML:
         return processed
 
     def _build_full_dataset(
-        self, processed: dict, use_triple_barrier: bool
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Build full X, y_clf, y_reg arrays sorted by date (no leakage within stock)."""
-        rows = []
+        self, processed: dict, use_triple_barrier: bool,
+        global_test_cutoff: pd.Timestamp = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
+        """
+        Build full X, y_clf, y_reg arrays sorted by date (no leakage within stock).
+
+        Also builds self._tcn_stock_train / self._tcn_stock_test:
+        per-stock chronological arrays used by _train_tcn_safe to build
+        VALID temporal sequences.
+
+        WHY TCN NEEDS SEPARATE PER-STOCK ARRAYS:
+        The main X array is date-sorted (cross-sectional). On any date there are
+        ~154 consecutive rows (one per stock). Building X[i-30:i] gives 30 rows
+        from 30 DIFFERENT STOCKS on the same dates — a cross-section, not a
+        time series. This made the TCN AUC = 0.504 despite converged training.
+        Fix: keep per-stock chronological arrays and sample sequences per stock.
+
+        ALIGNMENT FIX (v8.4): Also returns `row_ids` — a parallel list of
+        (ticker, date) tuples for every row in the global array.  This lets
+        the ensemble AUC code JOIN tabular predictions with TCN predictions
+        on the correct (ticker, date) pair, instead of blind slicing.
+        """
+        rows = []          # (date, features, label, sharpe, ticker)
+        tcn_stock_train = {}
+        tcn_stock_test  = {}
+        tcn_stock_test_dates = {}   # ticker -> array of dates for TCN test split
+
         for ticker, df in processed.items():
             try:
                 if "Date" in df.columns:
@@ -2001,15 +2071,43 @@ class AlphaYantraML:
                 S = sharpe[valid].values.astype(np.float32)
                 idx = df[valid].index
                 for i in range(len(F)):
-                    rows.append((idx[i], F[i], Y[i], S[i]))
+                    rows.append((idx[i], F[i], Y[i], S[i], ticker))
+                # Per-stock arrays for TCN — chronological order already
+                # DATE LEAKAGE FIX (v8.5): Use global date cutoff instead of
+                # fixed 80/20 percentage. A stock that started in 2020 with 80/20
+                # has TCN "test" from 2023, while a 2010 stock has it from 2018.
+                # Using the same global cutoff ensures all stocks have the same
+                # temporal boundary as the tabular train/test split.
+                if len(F) >= 60:
+                    if global_test_cutoff is not None:
+                        # Use global date cutoff for consistency
+                        train_mask = idx < global_test_cutoff
+                        test_mask  = idx >= global_test_cutoff
+                        n_train = train_mask.sum()
+                        n_test  = test_mask.sum()
+                        if n_train >= 30 and n_test >= 10:
+                            tcn_stock_train[ticker] = (F[train_mask], Y[train_mask])
+                            tcn_stock_test[ticker]  = (F[test_mask],  Y[test_mask])
+                            tcn_stock_test_dates[ticker] = idx[test_mask]
+                    else:
+                        # Fallback: fixed 80/20 if no global cutoff provided
+                        split = int(len(F) * 0.8)
+                        tcn_stock_train[ticker] = (F[:split], Y[:split])
+                        tcn_stock_test[ticker]  = (F[split:],  Y[split:])
+                        tcn_stock_test_dates[ticker] = idx[split:]
             except Exception as e:
                 logger.debug(f"Full dataset {ticker}: {e}")
 
-        rows.sort(key=lambda r: r[0])   # sort by date — prevents leakage
+        rows.sort(key=lambda r: r[0])
         X      = np.stack([r[1] for r in rows])
         y_clf  = np.array([r[2] for r in rows])
         y_reg  = np.array([r[3] for r in rows])
-        return X, y_clf, y_reg
+        row_ids = [(r[4], r[0]) for r in rows]   # (ticker, date) per row
+
+        self._tcn_stock_train = tcn_stock_train
+        self._tcn_stock_test  = tcn_stock_test
+        self._tcn_stock_test_dates = tcn_stock_test_dates
+        return X, y_clf, y_reg, row_ids
 
     def _train_tcn_safe(
         self, X_train_s, y_train, X_test_s, y_test,
@@ -2039,31 +2137,61 @@ class AlphaYantraML:
 
         logger.info("  TCN architecture: 4 dilated conv layers, receptive field = 48 days")
 
-        n_avail = len(X_train_s) - seq_len
-        step    = max(1, n_avail // actual_samples)
-        indices = np.arange(seq_len, seq_len + n_avail, step)[:actual_samples]
+        # ── Per-stock stratified sequence sampling ────────────────────
+        # CRITICAL FIX: The old code sampled from the date-sorted cross-sectional
+        # array (X_train_s), creating "sequences" of 30 rows from 30 DIFFERENT
+        # STOCKS on the same dates — not temporal sequences at all. This caused
+        # the TCN to learn nothing useful (AUC = 0.504 despite converged loss).
+        #
+        # Fix: use self._tcn_stock_train which has per-stock chronological arrays.
+        # Sample sequences from each stock individually, ensuring every sequence
+        # is 30 consecutive days of the SAME STOCK.
+        # Proportional allocation: each stock contributes sequences proportional
+        # to its length, ensuring no stock dominates.
 
-        # Build sequences in one shot if we have enough RAM, otherwise chunk
-        if seq_gb < ram_gb * 0.50:
-            # Fits in RAM — fast path
-            Xs = np.stack([X_train_s[i-seq_len:i] for i in indices]).astype(np.float32)
-            ys = y_train[indices].astype(np.float32)
-            logger.info(f"  Sequences loaded into RAM: {len(Xs):,}")
-            dataset = TensorDataset(torch.from_numpy(Xs), torch.from_numpy(ys))
-            del Xs, ys; gc.collect()
+        all_seq_x, all_seq_y = [], []
+        stock_arrays = getattr(self, '_tcn_stock_train', {})
+
+        if stock_arrays:
+            # Proportional allocation: longer history stocks get more sequences
+            total_avail = sum(max(0, len(F) - seq_len) for F, _ in stock_arrays.values())
+            for ticker, (F_stock, y_stock) in stock_arrays.items():
+                if len(F_stock) < seq_len + 5:
+                    continue
+                n_avail_stock = len(F_stock) - seq_len
+                # Proportional share of the total budget
+                share = n_avail_stock / max(1, total_avail)
+                n_take = max(5, int(actual_samples * share))
+                step   = max(1, n_avail_stock // n_take)
+                idxs   = list(range(seq_len, len(F_stock), step))[:n_take]
+                for i in idxs:
+                    all_seq_x.append(F_stock[i-seq_len +1 :i+1])
+                    all_seq_y.append(float(y_stock[i]))
+
+            # Shuffle and cap to actual_samples
+            perm = np.random.permutation(len(all_seq_x))
+            all_seq_x = [all_seq_x[i] for i in perm[:actual_samples]]
+            all_seq_y = [all_seq_y[i] for i in perm[:actual_samples]]
+            n_built = len(all_seq_x)
+            logger.info(f"  Sequences built per-stock: {n_built:,} from {len(stock_arrays)} stocks")
         else:
-            # Very low RAM: build as list of tensors (slower but safe)
-            logger.info(f"  Low RAM mode: streaming sequences (slower but safe)")
-            tensors_x, tensors_y = [], []
-            for i in indices:
-                tensors_x.append(torch.from_numpy(X_train_s[i-seq_len:i].astype(np.float32)))
-                tensors_y.append(float(y_train[i]))
-            Xs = torch.stack(tensors_x)
-            ys = torch.tensor(tensors_y, dtype=torch.float32)
-            dataset = TensorDataset(Xs, ys)
-            del tensors_x, tensors_y; gc.collect()
+            # Fallback: old cross-sectional method (used if per-stock arrays unavailable)
+            logger.warning("  TCN: falling back to cross-sectional sampling (per-stock data unavailable)")
+            n_avail = len(X_train_s) - seq_len
+            step    = max(1, n_avail // actual_samples)
+            indices = np.arange(seq_len, seq_len + n_avail, step)[:actual_samples]
+            all_seq_x = [X_train_s[i-seq_len+1:i+1] for i in indices]
+            all_seq_y = [float(y_train[i]) for i in indices]
+            n_built = len(all_seq_x)
+            logger.info(f"  Sequences loaded (fallback): {n_built:,}")
 
-        self.tcn_model = TCNModel(n_features=n_feat, n_channels=32, n_levels=4, kernel_size=3)
+        Xs = np.stack(all_seq_x).astype(np.float32)
+        ys = np.array(all_seq_y, dtype=np.float32)
+        dataset = TensorDataset(torch.from_numpy(Xs), torch.from_numpy(ys))
+        logger.info(f"  Sequences in dataset: {len(dataset):,}")
+        del Xs, ys, all_seq_x, all_seq_y; gc.collect()
+
+        self.tcn_model = TCNModel(n_features=n_feat, n_channels=64, n_levels=4, kernel_size=3)  # upgraded 32→64 for 79 features
         n_params = sum(p.numel() for p in self.tcn_model.parameters())
         logger.info(f"  TCN parameters: {n_params:,}  batch_size={actual_batch}")
 
@@ -2095,6 +2223,11 @@ class AlphaYantraML:
                             drop_last=True)   # drop_last for stable batch norm
 
         self.tcn_model.train()
+        best_loss    = float('inf')
+        patience     = 5        # stop if no improvement for 5 consecutive epochs
+        no_improve   = 0
+        best_weights = None
+
         for epoch in range(epochs):
             total = 0.0
             for xb, yb in loader:
@@ -2106,10 +2239,27 @@ class AlphaYantraML:
                 opt.step()
                 total += loss.item()
             scheduler.step()
+            epoch_loss = total / max(1, len(loader))
             logger.info(
-                f"  TCN epoch {epoch+1}/{epochs}: loss={total/max(1,len(loader)):.4f}  "
+                f"  TCN epoch {epoch+1}/{epochs}: loss={epoch_loss:.4f}  "
                 f"lr={scheduler.get_last_lr()[0]:.2e}"
             )
+
+            # Early stopping: save best weights, stop if stalled
+            if epoch_loss < best_loss - 1e-4:
+                best_loss    = epoch_loss
+                no_improve   = 0
+                # Save best weights to restore after potential degradation
+                best_weights = {k: v.clone() for k, v in self.tcn_model.state_dict().items()}
+            else:
+                no_improve += 1
+                if no_improve >= patience and epoch >= 15:
+                    logger.info(f"  TCN early stop at epoch {epoch+1} (no improvement for {patience} epochs)")
+                    break
+
+        # Restore best weights if we have them
+        if best_weights is not None:
+            self.tcn_model.load_state_dict(best_weights)
 
         # Restore Sigmoid for standard predict_proba-style outputs (0-1 range)
         self.tcn_model.head[-1] = nn.Sigmoid()
@@ -2117,12 +2267,39 @@ class AlphaYantraML:
 
         del loader, dataset; gc.collect()
 
-        # Inference: always batched, safe on any RAM
-        infer_batch = min(256, actual_batch)
+        # ── Per-stock inference (same fix as training) ───────────────
+        # Must use per-stock arrays so test sequences are temporal, not cross-sectional
+        infer_batch  = min(256, actual_batch)
         logger.info(f"  TCN inference (batch={infer_batch})...")
-        tcn_pred, idx = tcn_predict_batched(self.tcn_model, X_test_s, seq_len, infer_batch)
-        tcn_auc = roc_auc_score(y_test[idx], tcn_pred)
-        tcn_acc = accuracy_score(y_test[idx], tcn_pred > 0.5)
+        stock_test = getattr(self, '_tcn_stock_test', {})
+        all_true, all_pred = [], []
+
+        if stock_test:
+            for ticker, (F_test, y_test_stock) in stock_test.items():
+                if len(F_test) < seq_len + 5:
+                    continue
+                preds_stock, idx_stock = tcn_predict_batched(
+                    self.tcn_model, F_test, seq_len, infer_batch
+                )
+                if len(preds_stock) > 0:
+                    all_pred.extend(preds_stock.tolist())
+                    all_true.extend(y_test_stock[idx_stock].tolist())
+            logger.info(f"  TCN per-stock inference: {len(all_pred):,} predictions from {len(stock_test)} stocks")
+        else:
+            # Fallback to cross-sectional (old behaviour)
+            preds, idx = tcn_predict_batched(self.tcn_model, X_test_s, seq_len, infer_batch)
+            all_pred = preds.tolist()
+            all_true = y_test[idx].tolist()
+
+        if len(all_pred) < 10:
+            logger.warning("TCN: too few predictions — returning 0.5")
+            self.tcn_trained = True
+            return 0.5
+
+        tcn_pred_arr = np.array(all_pred)
+        tcn_true_arr = np.array(all_true)
+        tcn_auc = roc_auc_score(tcn_true_arr, tcn_pred_arr)
+        tcn_acc = accuracy_score(tcn_true_arr, tcn_pred_arr > 0.5)
         logger.info(f"TCN → AUC: {tcn_auc:.3f}  Acc: {tcn_acc:.1%}")
         self.tcn_trained = True
         return tcn_auc
@@ -2177,7 +2354,7 @@ class AlphaYantraML:
         self.cv_metrics  = joblib.load(path / "cv_metrics.pkl") if (path/"cv_metrics.pkl").exists() else []
         if self.tcn_trained:
             n_feat = len(self.feature_cols)
-            self.tcn_model = TCNModel(n_features=n_feat, n_channels=32, n_levels=4, kernel_size=3)
+            self.tcn_model = TCNModel(n_features=n_feat, n_channels=64, n_levels=4, kernel_size=3)  # upgraded 32→64 for 79 features
             weights_file = path / "tcn.pt" if (path/"tcn.pt").exists() else path / "lstm.pt"
             if weights_file.exists():
                 self.tcn_model.load_state_dict(torch.load(weights_file, map_location="cpu"))

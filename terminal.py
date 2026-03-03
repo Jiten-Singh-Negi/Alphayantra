@@ -96,6 +96,8 @@ _state: dict = {
     "signals":        [],
     "portfolio":      {},
     "positions_list": [],
+    "risk_status":    {"daily_pnl": 0.0, "peak_dd_pct": 0.0,
+                       "capital_deployed_pct": 0.0, "total_capital": 1_000_000.0},
     "vix":            15.0,
     "pcr":            1.0,
     "iv_rank":        50.0,
@@ -246,6 +248,7 @@ class MLInferenceThread(threading.Thread):
                         "kelly_fraction":  res.get("kelly_fraction", 0.01),
                         "regime":          res.get("regime", "normal"),
                         "weights":         res.get("ensemble_weights", {}),
+                        "liquidity_sweep": res.get("liquidity_sweep", 0.0),
                         "ts":              datetime.now(IST).strftime("%H:%M:%S"),
                     }
 
@@ -408,8 +411,14 @@ class PaperTraderThread(threading.Thread):
                 # ── Update live P&L ─────────────────────────────────────
                 try:
                     # Inject latest prices from quotes dict
+                    # FIX (v8.4): Take a snapshot UNDER trader._lock so the
+                    # kill switch (_cb_kill) can't delete positions mid-iteration.
+                    # Without this, pressing SPACE during this loop causes:
+                    #   RuntimeError: dictionary changed size during iteration
                     quotes = _get("quotes")
-                    for ticker, pos in trader.positions.items():
+                    with trader._lock:
+                        positions_snapshot = list(trader.positions.items())
+                    for ticker, pos in positions_snapshot:
                         q = quotes.get(ticker, {})
                         ltp = float(q.get("ltp", 0) or 0)
                         if ltp > 0:
@@ -424,7 +433,8 @@ class PaperTraderThread(threading.Thread):
                                 pos.trailing_stop = ltp * (1 - trail / 100)
 
                             if ltp <= pos.trailing_stop and pos.trailing_stop > 0:
-                                trader._auto_exit(ticker, ltp, "TRAIL_STOP")
+                                with trader._lock:
+                                    trader._auto_exit(ticker, ltp, "TRAIL_STOP")
                                 _THREAD_LOG_Q.put_nowait(
                                     f"[{datetime.now(IST).strftime('%H:%M:%S')}] "
                                     f"🔴 TRAIL STOP hit {ticker} @ ₹{ltp:,.0f}"
@@ -460,9 +470,11 @@ TAG_REGIME    = "regime_text"
 TAG_W_RF      = "w_rf"
 TAG_W_XGB     = "w_xgb"
 TAG_W_TCN     = "w_tcn"
-TAG_SIG_TABLE = "signal_table"
-TAG_PORTFOLIO = "portfolio_text"
-TAG_POSITIONS = "positions_text"
+TAG_SIG_TABLE  = "signal_table"
+TAG_PORTFOLIO  = "portfolio_text"
+TAG_POSITIONS  = "positions_text"
+TAG_RISK_TBL   = "risk_dashboard_tbl"
+TAG_POS_TABLE  = "positions_table"
 TAG_LEDGER    = "trade_log_scroll"
 TAG_MKT       = "market_status"
 TAG_NIFTY_P   = "nifty_price"
@@ -694,11 +706,12 @@ def build_ui(watchlist: list):
                                scrollY=True, height=300, freeze_rows=1,
                                policy=dpg.mvTable_SizingFixedFit):
                     dpg.add_table_column(label="Symbol", init_width_or_weight=68)
-                    dpg.add_table_column(label="Signal", init_width_or_weight=88)
-                    dpg.add_table_column(label="P%",     init_width_or_weight=48)
-                    dpg.add_table_column(label="Sharpe", init_width_or_weight=52)
-                    dpg.add_table_column(label="Ret%",   init_width_or_weight=50)
-                    dpg.add_table_column(label="Time",   init_width_or_weight=52)
+                    dpg.add_table_column(label="Signal", init_width_or_weight=80)
+                    dpg.add_table_column(label="P%",     init_width_or_weight=38)
+                    dpg.add_table_column(label="Sharpe", init_width_or_weight=48)
+                    dpg.add_table_column(label="Ret%",   init_width_or_weight=42)
+                    dpg.add_table_column(label="Sweep",  init_width_or_weight=42)
+                    dpg.add_table_column(label="Time",   init_width_or_weight=48)
 
                 dpg.add_spacer(height=5)
                 dpg.add_separator()
@@ -715,20 +728,37 @@ def build_ui(watchlist: list):
             # ═══════ Column 3: Execution & Risk ═══════════════════════
             with dpg.child_window(width=370, height=840, border=True):
 
-                # Portfolio summary
-                dpg.add_text("Paper Portfolio", color=C_BLUE)
+                # ── Risk Management Dashboard ──────────────────────────
+                dpg.add_text("Risk Dashboard", color=C_BLUE)
                 dpg.add_separator()
                 dpg.add_spacer(height=3)
-                dpg.add_text("No positions yet", tag=TAG_PORTFOLIO,
-                             color=C_MUTED, wrap=358)
 
-                dpg.add_spacer(height=4)
+                with dpg.table(header_row=True, borders_innerH=True,
+                               borders_outerH=True, tag=TAG_RISK_TBL,
+                               policy=dpg.mvTable_SizingStretchProp):
+                    dpg.add_table_column(label="Metric",  init_width_or_weight=0.55)
+                    dpg.add_table_column(label="Value",   init_width_or_weight=0.45)
+                    for label_ in ["Daily PnL", "Peak Drawdown %",
+                                   "Capital Deployed %", "Total Capital"]:
+                        with dpg.table_row():
+                            dpg.add_text(label_, color=C_MUTED)
+                            dpg.add_text("—", tag=f"risk_{label_.lower().replace(' ','_').replace('%','pct')}",
+                                         color=C_MUTED)
 
-                # Open positions detail
-                dpg.add_text("Open Positions", color=C_MUTED)
-                dpg.add_input_text(tag=TAG_POSITIONS, multiline=True,
-                                   readonly=True, default_value="—",
-                                   width=-1, height=100)
+                dpg.add_spacer(height=6)
+
+                # ── Active Trade Ledger ────────────────────────────────
+                dpg.add_text("Active Trades", color=C_BLUE)
+                dpg.add_spacer(height=3)
+
+                with dpg.table(header_row=True, borders_innerH=True,
+                               borders_outerH=True, tag=TAG_POS_TABLE,
+                               scrollY=True, height=110,
+                               policy=dpg.mvTable_SizingFixedFit):
+                    dpg.add_table_column(label="Ticker",    init_width_or_weight=78)
+                    dpg.add_table_column(label="Float PnL", init_width_or_weight=88)
+                    dpg.add_table_column(label="Trail SL",  init_width_or_weight=88)
+                    dpg.add_table_column(label="Mkt Price", init_width_or_weight=88)
 
                 dpg.add_spacer(height=6)
                 dpg.add_separator()
@@ -1021,14 +1051,17 @@ def _cb_kill(sender=None, app_data=None, user_data=None):
         trader = _get("_paper_trader")
         if trader:
             quotes = _get("quotes")
-            for ticker in list(trader.positions.keys()):
-                price = float(quotes.get(ticker, {}).get("ltp", 0) or 0)
-                if price > 0:
-                    trader._auto_exit(ticker, price, "KILL_SWITCH")
-                    _THREAD_LOG_Q.put_nowait(
-                        f"[{datetime.now(IST).strftime('%H:%M:%S')}] "
-                        f"⚡ KILL: flattened {ticker} @ ₹{price:,.0f}"
-                    )
+            # FIX (v8.4): Acquire trader._lock to prevent RuntimeError from
+            # concurrent iteration in PaperTraderThread.run().
+            with trader._lock:
+                for ticker in list(trader.positions.keys()):
+                    price = float(quotes.get(ticker, {}).get("ltp", 0) or 0)
+                    if price > 0:
+                        trader._auto_exit(ticker, price, "KILL_SWITCH")
+                        _THREAD_LOG_Q.put_nowait(
+                            f"[{datetime.now(IST).strftime('%H:%M:%S')}] "
+                            f"⚡ KILL: flattened {ticker} @ ₹{price:,.0f}"
+                        )
 
         _THREAD_LOG_Q.put_nowait("[⚡ KILL SWITCH ACTIVATED — All positions flattened]")
         try:
@@ -1176,10 +1209,18 @@ def _update_signal_table():
         for child in dpg.get_item_children(TAG_SIG_TABLE, 1) or []:
             dpg.delete_item(child)
         for s in sigs:
-            sig  = s.get("signal", "HOLD")
-            prob = s.get("probability", 0.5)
-            shr  = s.get("expected_sharpe", 0.0)
-            ret  = s.get("expected_return", 0.0)
+            sig   = s.get("signal", "HOLD")
+            prob  = s.get("probability", 0.5)
+            shr   = s.get("expected_sharpe", 0.0)
+            ret   = s.get("expected_return", 0.0)
+            sweep = s.get("liquidity_sweep", 0.0)
+            # Sweep icon: bull sweep → 🐂, bear sweep → 🐻, none → —
+            if sweep > 0:
+                sweep_icon, sweep_c = "🐂", C_GREEN
+            elif sweep < 0:
+                sweep_icon, sweep_c = "🐻", C_RED
+            else:
+                sweep_icon, sweep_c = "—", C_MUTED
             with dpg.table_row(parent=TAG_SIG_TABLE):
                 dpg.add_text(s.get("ticker", ""), color=C_BLUE)
                 dpg.add_text(sig, color=_c_signal(sig))
@@ -1188,6 +1229,7 @@ def _update_signal_table():
                              color=C_GREEN if shr > 0.5 else (C_RED if shr < 0 else C_MUTED))
                 dpg.add_text(f"{ret:+.1f}%",
                              color=C_GREEN if ret > 0 else (C_RED if ret < 0 else C_MUTED))
+                dpg.add_text(sweep_icon, color=sweep_c)
                 dpg.add_text(s.get("ts", ""))
     except Exception as e:
         logger.debug(f"Signal table: {e}")
@@ -1218,32 +1260,55 @@ def _update_portfolio():
         p = _get("portfolio")
         if not p:
             return
-        pnl   = p.get("total_pnl", 0)
-        c     = C_GREEN if pnl >= 0 else C_RED
-        txt   = (
-            f"P&L: ₹{pnl:+,.0f}   "
-            f"Realised: ₹{p.get('realised_pnl',0):+,.0f}\n"
-            f"Open: {p.get('open_positions',0)}   "
-            f"Trades: {p.get('total_trades',0)}   "
-            f"Win%: {p.get('win_rate',0):.1f}%"
-        )
-        dpg.configure_item(TAG_PORTFOLIO, default_value=txt, color=c)
 
-        # Open positions detail
-        pos_lines = []
+        # ── Risk Dashboard: update the 4 metric cells ──────────────────
+        daily_pnl   = p.get("total_pnl", 0.0)
+        total_cap   = p.get("total_capital", 1_000_000.0)
+        realised    = p.get("realised_pnl", 0.0)
+        open_count  = p.get("open_positions", 0)
+        peak_dd     = p.get("peak_drawdown_pct", 0.0)
+        deployed    = p.get("capital_deployed_pct", 0.0)
+
+        # Update risk_status in state for external readers
+        _upd("risk_status", {
+            "daily_pnl": daily_pnl, "peak_dd_pct": peak_dd,
+            "capital_deployed_pct": deployed, "total_capital": total_cap,
+        })
+
+        # Daily PnL
+        pnl_c = C_GREEN if daily_pnl >= 0 else C_RED
+        dpg.configure_item("risk_daily_pnl",
+                           default_value=f"₹{daily_pnl:+,.0f}", color=pnl_c)
+
+        # Peak Drawdown %
+        dd_c = C_RED if peak_dd > 5.0 else (C_YELLOW if peak_dd > 2.0 else C_GREEN)
+        dpg.configure_item("risk_peak_drawdown_pct",
+                           default_value=f"{peak_dd:.2f}%", color=dd_c)
+
+        # Capital Deployed %
+        dep_c = C_YELLOW if deployed > 60 else C_GREEN
+        dpg.configure_item("risk_capital_deployed_pct",
+                           default_value=f"{deployed:.1f}%", color=dep_c)
+
+        # Total Capital
+        dpg.configure_item("risk_total_capital",
+                           default_value=f"₹{total_cap:,.0f}", color=C_TEXT)
+
+        # ── Active Trade Ledger: rebuild rows ───────────────────────
+        for ch in dpg.get_item_children(TAG_POS_TABLE, 1) or []:
+            dpg.delete_item(ch)
+
         for pos in p.get("positions", []):
-            pnl_c = "+" if pos["pnl"] >= 0 else ""
-            pos_lines.append(
-                f"{pos['ticker']:12s}  ×{pos['qty']}  "
-                f"avg ₹{pos['avg_price']:,.0f}  "
-                f"cur ₹{pos['current']:,.0f}  "
-                f"P&L {pnl_c}₹{pos['pnl']:,.0f}  "
-                f"SL ₹{pos['stop_loss']:,.0f}"
-            )
-        dpg.configure_item(TAG_POSITIONS,
-                           default_value="\n".join(pos_lines) if pos_lines else "No open positions")
-    except Exception:
-        pass
+            pnl_val = pos.get("pnl", 0.0)
+            pnl_c   = C_GREEN if pnl_val >= 0 else C_RED
+            with dpg.table_row(parent=TAG_POS_TABLE):
+                dpg.add_text(pos.get("ticker", ""), color=C_BLUE)
+                dpg.add_text(f"₹{pnl_val:+,.0f}", color=pnl_c)
+                dpg.add_text(f"₹{pos.get('stop_loss', 0):,.0f}", color=C_ORANGE)
+                dpg.add_text(f"₹{pos.get('current', 0):,.0f}", color=C_TEXT)
+
+    except Exception as e:
+        logger.debug(f"Portfolio update: {e}")
 
 
 def _update_trade_log():
@@ -1357,7 +1422,7 @@ def render_tick(tick_q: multiprocessing.Queue, feed_proc):
     _frame += 1
 
     # Always: drain feed queue (core data pipeline — never skip)
-    _drain_mp_queue(tick_q, max_items=100)
+    _drain_mp_queue(tick_q)
 
     # 10fps: lightweight gauge updates
     if _frame % 6 == 0:
